@@ -1,0 +1,4 @@
+node_modules/
+flowmap-out/
+auth.json
+*storageState*.json

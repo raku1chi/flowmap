@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8" />
+<title>Inventory Demo</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<link rel="icon" href="data:," />
+<link rel="stylesheet" href="/app.css" />
+</head>
+<body>
+<header class="top">
+  <a href="/" class="brand" data-link>在庫管理デモ</a>
+  <nav>
+    <a href="/items" data-link>商品一覧</a>
+    <a href="/contact" data-link>お問い合わせ</a>
+    <a href="/settings" data-link>設定</a>
+    <a href="/report" data-link>レポート</a>
+    <a href="/about" data-link>このアプリについて</a>
+  </nav>
+  <button id="logout" class="ghost">ログアウト</button>
+</header>
+<main id="app"></main>
+<div id="modal-root"></div>
+<script type="module" src="/app.js"></script>
+</body>
+</html>

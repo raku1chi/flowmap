@@ -1,0 +1,9 @@
+{
+  "baseUrl": "http://localhost:3210",
+  "outDir": "flowmap-out",
+  "maxStates": 40,
+  "maxDepth": 5,
+  "maxActionsPerState": 20,
+  "settleMs": 300,
+  "denyText": ["ログアウト", "削除", "退会", "logout", "sign out", "delete"]
+}

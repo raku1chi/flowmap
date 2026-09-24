@@ -1,0 +1,28 @@
+{
+  "name": "flowmap",
+  "version": "0.1.0",
+  "description": "SPA を自動探索して画面遷移をフローチャートとスクリーンショットで一望するツール",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "flowmap": "./bin/flowmap.mjs"
+  },
+  "scripts": {
+    "demo": "node demo/server.mjs",
+    "explore": "tsx src/cli.ts explore",
+    "render": "tsx src/cli.ts render",
+    "typecheck": "tsc --noEmit"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "packageManager": "pnpm@10.28.2",
+  "dependencies": {
+    "playwright": "^1.63.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.6.2",
+    "tsx": "^4.23.15",
+    "typescript": "^7.0.2"
+  }
+}
