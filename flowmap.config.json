@@ -1,9 +1,11 @@
 {
+  // デモアプリ（pnpm demo）を探索する設定。キーの意味は DESIGN.md §11
   "baseUrl": "http://localhost:3210",
   "outDir": "flowmap-out",
   "maxStates": 40,
   "maxDepth": 5,
   "maxActionsPerState": 20,
-  "settleMs": 300,
-  "denyText": ["ログアウト", "削除", "退会", "logout", "sign out", "delete"]
+  "denyText": ["ログアウト", "削除", "退会", "logout", "sign out", "delete"],
+  // ヘッダの検索で商品が見つかるように、検索欄だけ入力値を変える
+  "fill": { "search": "ノート" }
 }

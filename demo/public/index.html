@@ -4,6 +4,7 @@
 <meta charset="utf-8" />
 <title>Inventory Demo</title>
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="demo-external" content="__EXTERNAL_URL__" />
 <link rel="icon" href="data:," />
 <link rel="stylesheet" href="/app.css" />
 </head>
@@ -17,9 +18,21 @@
     <a href="/report" data-link>レポート</a>
     <a href="/about" data-link>このアプリについて</a>
   </nav>
+  <form class="search" role="search" id="search-form">
+    <input type="search" name="q" placeholder="商品名で検索" autocomplete="off" aria-label="商品名で検索" />
+    <button type="submit">検索</button>
+    <div class="suggest" id="suggest" hidden></div>
+  </form>
   <button id="logout" class="ghost">ログアウト</button>
 </header>
+<div class="prefbar">
+  <!-- 表示順はこの端末の localStorage に保存され、開き直しても残る。summary には今の値が出る -->
+  <details id="pref"><summary>表示順: <b id="pref-label">標準</b></summary>
+    <div class="row" id="pref-options"></div>
+  </details>
+</div>
 <main id="app"></main>
+<footer class="foot">在庫管理デモ · <span data-flowmap-volatile>サーバー時刻 <span id="clock">--:--:--</span></span></footer>
 <div id="modal-root"></div>
 <script type="module" src="/app.js"></script>
 </body>
