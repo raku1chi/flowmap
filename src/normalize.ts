@@ -8,6 +8,9 @@
 //   1. ID に見える区間（数字だけ・UUID・長いハッシュ）は常にデータ
 //   2. 設定 pathRules（正規表現）で人が宣言する
 //   3. 同じ画面に「1 区間だけ違う同じ形の href」が minSiblings 本以上あれば、その区間をデータとみなす（自動学習）
+//
+// 画面の中のデータ（企業名・商品名）は、見出しと操作のラベルから消す（pageData）。一覧の各行に並ぶ「〇〇を並べて比べる」の
+// ようなボタンは、データを消すと同じ形になって 1 つに畳まれる。
 
 import { createHash } from 'node:crypto';
 import type { Snapshot } from './inpage.js';
@@ -29,6 +32,11 @@ export interface NormalizeContext {
   structuralParams: string[];
   /** 値をデータとみなすパラメータ名（`?id=12` → `?id=*`） */
   dataParams?: string[];
+  /**
+   * 自動学習した「クエリで絞り込む一覧」のルート（`/companies`）。queryParams が ignore のとき、同じルートへの
+   * クエリだけ違うリンクが 2 通り以上ある画面から学ぶ。絞り込みで変わる h1（「テレワーク制度のある会社」）はデータとみなす
+   */
+  queryVariantPaths?: Set<string>;
 }
 
 export const sha1 = (s: string): string => createHash('sha1').update(s).digest('hex');
@@ -212,13 +220,43 @@ export function learnDataSegments(hrefs: string[], pageUrl: string, ctx: Normali
   return proposals.map((p) => p.prefix);
 }
 
-/** データ値をテキストから消す。見出し「サービス業の企業一覧」を「*の企業一覧」にして、業種違いの画面を合流させる */
+/**
+ * クエリだけが違う同じルートへのリンクが 2 通り以上ある画面から、「クエリで絞り込む一覧」のルートを見つける（ctx は変えない）。
+ * queryParams が ignore のときだけ（names・values ではクエリがルートに入るので、そもそも別の画面になる）。
+ * `/companies?has=telework` と `/companies?has=flextime` は、h1 だけが違う同じ一覧なので、h1 をデータとみなして合流させる。
+ * structuralParams・dataParams に挙げたパラメータは数えない
+ */
+export function proposeQueryVariantPaths(items: LinkItem[], pageUrl: string, ctx: NormalizeContext): string[] {
+  if (ctx.queryParams !== 'ignore') return [];
+  const byRoute = new Map<string, Set<string>>();
+  const add = (href: string) => {
+    let u: URL;
+    try { u = new URL(href, pageUrl); } catch { return; }
+    const r = normalizeRoute(u.href, ctx);
+    if (!r) return;
+    const params = new URLSearchParams(splitUrl(u).search);
+    const rest = [...params].filter(([k]) => !ctx.structuralParams.includes(k) && !ctx.dataParams?.includes(k)).map(([k, v]) => `${k}=${v}`).sort().join('&');
+    if (!rest) return;
+    const set = byRoute.get(r.route) ?? new Set<string>();
+    byRoute.set(r.route, set);
+    set.add(rest);
+  };
+  add(pageUrl);
+  for (const it of items) add(it.href);
+  return [...byRoute].filter(([route, qs]) => qs.size >= 2 && !ctx.queryVariantPaths?.has(route)).map(([route]) => route);
+}
+
+/** データとして扱える文字列か。数字・記号・空白を除いて 2 文字以上（「2」や「#」で無関係な部分を消さないため） */
+const isDataText = (v: string): boolean => v.replace(/[#\d\s\p{P}\p{S}]/gu, '').length >= 2;
+
+/**
+ * データ値をテキストから消す。見出し「サービス業の企業一覧」を「*の企業一覧」にして、業種違いの画面を合流させる。
+ * text は数字を潰したもの（normalizeDigits）を渡す。値の数字も同じように潰して比べる
+ */
 export function scrub(text: string, dataValues: string[]): string {
+  const values = [...new Set(dataValues.map((v) => normalizeDigits(v.trim())))].filter(isDataText).sort((a, b) => b.length - a.length);
   let out = text;
-  for (const v of [...dataValues].sort((a, b) => b.length - a.length)) {
-    if (v.length < 2 || /^\d+$/.test(v)) continue;
-    out = out.split(v).join('*');
-  }
+  for (const v of values) out = out.split(v).join('*');
   return out;
 }
 
@@ -236,7 +274,7 @@ export interface ActionLike {
  * 外部サイトは撮影しかしないので、行き先の細部で画面を区別する意味がない。
  * 開閉・ポップアップの操作（summary、aria-expanded など）はラベルに今の値（「表示: 在庫あり優先 ▾」）が出るので、ラベルを見ない。
  */
-export function actionKey(a: ActionLike, pageUrl: string, ctx: NormalizeContext, dataValues: string[]): string {
+export function actionKey(a: ActionLike, pageUrl: string, ctx: NormalizeContext, dataValues: string[], fold?: Map<string, string>): string {
   if (a.href) {
     let abs: URL | undefined;
     try { abs = new URL(a.href, pageUrl); } catch { abs = undefined; }
@@ -246,7 +284,94 @@ export function actionKey(a: ActionLike, pageUrl: string, ctx: NormalizeContext,
     }
   }
   if (a.toggle) return `${a.role}|~`;
-  return `${a.role}|${scrub(normalizeDigits(a.label), dataValues)}`;
+  return `${a.role}|${labelKey(a, dataValues, fold)}`;
+}
+
+/**
+ * ラベルの形。数字を潰し、データの値を * にし、行ごとの同種の操作（fold）はデータの部分を * にした形にする。
+ * 開閉の操作もラベルで区別したいとき（同じ画面の別々の開閉を数えるとき）に使う
+ */
+export function labelKey(a: Pick<ActionLike, 'role' | 'label'>, dataValues: string[], fold?: Map<string, string>): string {
+  const pre = scrub(normalizeDigits(a.label), dataValues);
+  return fold?.get(`${a.role}|${pre}`) ?? pre;
+}
+
+/** 画面の中のデータ（pageData の結果） */
+export interface PageData {
+  /** データとみなして見出しとラベルから消す値（URL のデータ区間の値、データの見出し、データのルートへのリンクのラベル） */
+  values: string[];
+  /** 行ごとの同種の操作のラベル（`role|数字を潰したラベル`）→ データの部分を * にした形（`*を並べて比べる`） */
+  fold: Map<string, string>;
+}
+
+/** 行ごとの同種の操作とみなす群の最小の大きさ・共通部分の最短の長さ・違う部分の最短の長さ */
+const MIN_FAMILY = 4;
+const MIN_AFFIX = 3;
+const MIN_VARYING = 2;
+
+/**
+ * 画面の中のデータを見つける（DESIGN.md §5）。
+ * 1. データのルート（`/company/*`）へのリンクのラベルのうち、1 つの行き先にだけ使われているもの（企業名・商品名）。
+ *    同じルートにそういうラベルが 2 つ以上あるときだけ（一覧の各行）。「詳細」のように全行で同じラベルはデータではない
+ * 2. リンクでない操作（ボタンなど）で、共通の前置きか後置きを持つラベルの群（「ＡＩＡＩを並べて比べる」「ＩＨＩを並べて比べる」…）。
+ *    MIN_FAMILY 個以上あれば、違う部分をデータとみなして `*を並べて比べる` に畳む。共通部分は、群の大きさが最大の 8 割以上ある
+ *    ものから最も長いものを選ぶ（単独の「並べて比べる」ボタンに引きずられて「*比べる」まで縮まないように）
+ * base は先に分かっているデータの値（URL のデータ区間の値など）。
+ */
+export function pageData(actions: ActionLike[], pageUrl: string, ctx: NormalizeContext, base: string[] = []): PageData {
+  const values = [...base];
+  const byRoute = new Map<string, Map<string, Set<string>>>();
+  const hrefValues = new Map<string, string[]>();
+  for (const a of actions) {
+    if (!a.href) continue;
+    let u: URL;
+    try { u = new URL(a.href, pageUrl); } catch { continue; }
+    if (!/^https?:$/.test(u.protocol)) continue;
+    const r = normalizeRoute(u.href, ctx);
+    const label = a.label.trim();
+    if (!r?.dataDriven || !isDataText(label)) continue;
+    const labels = byRoute.get(r.route) ?? new Map<string, Set<string>>();
+    byRoute.set(r.route, labels);
+    const hrefs = labels.get(label) ?? new Set<string>();
+    labels.set(label, hrefs);
+    hrefs.add(u.href);
+    hrefValues.set(u.href, r.dataValues);
+  }
+  for (const labels of byRoute.values()) {
+    const named = [...labels].filter(([, hrefs]) => hrefs.size === 1);
+    // 行が 1 件だけだと「詳しく見る」も 1 つの行き先にしか使われないので、行き先が 2 件以上ある一覧だけを見る
+    if (named.length < 2 || new Set(named.map(([, hrefs]) => [...hrefs][0])).size < 2) continue;
+    for (const [label, hrefs] of named) values.push(label, ...(hrefValues.get([...hrefs][0]) ?? []));
+  }
+
+  const byRole = new Map<string, Set<string>>();
+  for (const a of actions) {
+    if (a.href || a.toggle) continue;
+    const pre = scrub(normalizeDigits(a.label), values);
+    if (pre.includes('*') || pre.length < MIN_AFFIX + MIN_VARYING) continue;
+    const set = byRole.get(a.role) ?? new Set<string>();
+    byRole.set(a.role, set);
+    set.add(pre);
+  }
+  const fold = new Map<string, string>();
+  const affixes = (l: string): string[] => {
+    const out: string[] = [];
+    for (let k = MIN_AFFIX; k <= l.length - MIN_VARYING; k++) out.push('S' + l.slice(l.length - k), 'P' + l.slice(0, k));
+    return out;
+  };
+  for (const [role, set] of byRole) {
+    if (set.size < MIN_FAMILY) continue;
+    const count = new Map<string, number>();
+    for (const l of set) for (const x of new Set(affixes(l))) count.set(x, (count.get(x) ?? 0) + 1);
+    for (const l of set) {
+      const cands = affixes(l).filter((x) => count.get(x)! >= MIN_FAMILY);
+      if (!cands.length) continue;
+      const max = Math.max(...cands.map((x) => count.get(x)!));
+      const best = cands.filter((x) => count.get(x)! >= max * 0.8).sort((x, y) => y.length - x.length || (x < y ? -1 : x > y ? 1 : 0))[0];
+      fold.set(`${role}|${l}`, best[0] === 'S' ? '*' + best.slice(1) : best.slice(1) + '*');
+    }
+  }
+  return { values, fold };
 }
 
 /**
@@ -286,38 +411,49 @@ export interface StructureInput {
 /**
  * 画面の骨格。開いているダイアログ・選ばれているタブ・見出し・操作対象・フォーム項目から作る。
  * - 同じ形の操作は 1 つに畳み、並べ替えるので、一覧の件数や節の順が変わっても骨格は変わらない。
+ * - 画面の中のデータ（pageData: 企業名・商品名）は見出しとラベルから消し、行ごとの同種のボタンは 1 つの形に畳む。
+ * - 同じ見出しが繰り返されても 1 行にする（カードごとの見出しがデータを消して同じになったとき、件数で骨格が変わらないように）。
  * - 今の画面と同じルートへのリンク（ページ送り・絞り込み・ページ内リンク）は画面の見方を変えるだけなので入れない。
  * - 開閉の操作はラベルを見ない（actionKey）。
- * - データ区間を持つルート（`/company/*`）の h1 はデータの名前（企業名・商品名）であることが多く、URL からは消せないので、
- *   文言を捨てて h1 があることだけを残し、その文言を他の見出しとラベルからも消す。h2 以下は残すのでタブや節の違いは区別できる。
+ * - データ区間を持つルート（`/company/*`）と、クエリで絞り込む一覧のルートの h1 はデータの名前（企業名・絞り込みの条件）で
+ *   あることが多いので、文言を捨てて h1 があることだけを残し、その文言を他の見出しとラベルからも消す。h2 以下は残す。
  * - volatileSelectors の中の要素は入れない（在庫の少ない商品、最近見たもの、時計など）。
  */
-export function structureOf(snap: StructureInput, pageUrl: string, ctx: NormalizeContext, route: Route): string {
-  const values = [...route.dataValues];
+export function analyzePage(snap: StructureInput, pageUrl: string, ctx: NormalizeContext, route: Route): { structure: string } & PageData {
+  const dataLike = route.dataDriven || !!ctx.queryVariantPaths?.has(route.route);
+  const base = [...route.dataValues];
   const h1 = snap.headings.find((h) => h.tag === 'h1');
-  if (route.dataDriven && h1 && h1.text.trim().length >= 2) values.push(h1.text.trim());
+  if (dataLike && h1 && isDataText(h1.text.trim())) base.push(h1.text.trim());
+  const actions = snap.actions.filter((a) => !a.volatile);
+  const { values, fold } = pageData(actions, pageUrl, ctx, base);
   const clean = (s: string) => scrub(normalizeDigits(s), values);
   const lines: string[] = [];
   if (snap.dialog !== undefined) lines.push(`d:${clean(snap.dialog)}`);
   for (const t of uniqSorted((snap.selectedTabs ?? []).map(clean))) lines.push(`t:${t}`);
-  for (const h of snap.headings) lines.push(route.dataDriven && h.tag === 'h1' ? 'h:h1' : `h:${h.tag}:${clean(h.text)}`);
+  lines.push(...new Set(snap.headings.map((h) => (dataLike && h.tag === 'h1' ? 'h:h1' : `h:${h.tag}:${clean(h.text)}`))));
   const acts: string[] = [];
-  for (const a of snap.actions) {
-    if (a.volatile) continue;
-    const key = actionKey(a, pageUrl, ctx, values);
+  for (const a of actions) {
+    const key = actionKey(a, pageUrl, ctx, values, fold);
     if (a.href && key === `${a.role}|${route.route}`) continue; // 同じルートへのリンク
     acts.push(`a:${key}`);
   }
   lines.push(...uniqSorted(acts));
   lines.push(...uniqSorted(snap.formFields.map((f) => `f:${normalizeDigits(f)}`)));
-  return lines.join('\n');
+  return { structure: lines.join('\n'), values, fold };
+}
+
+export function structureOf(snap: StructureInput, pageUrl: string, ctx: NormalizeContext, route: Route): string {
+  return analyzePage(snap, pageUrl, ctx, route).structure;
 }
 
 export interface SignatureResult {
   signature: string;
   /** 同一オリジンなら正規化ルート。別オリジンなら undefined */
   route?: string;
+  /** 画面の中のデータとみなした値（URL のデータ区間の値、データの見出し、データのリンクのラベル） */
   dataValues: string[];
+  /** 行ごとの同種の操作を畳んだ形（pageData） */
+  fold: Map<string, string>;
   structure: string;
 }
 
@@ -329,11 +465,79 @@ export function signatureOf(snap: Pick<Snapshot, 'url' | 'headings' | 'headingTa
   const r = normalizeRoute(snap.url, ctx);
   if (!r) {
     const ext = externalRoute(snap.url);
-    return { signature: sha1(`ext|${ext}`).slice(0, 12), dataValues: [], structure: ext };
+    return { signature: sha1(`ext|${ext}`).slice(0, 12), dataValues: [], fold: new Map(), structure: ext };
   }
   const headings = snap.headings.map((text, i) => ({ tag: snap.headingTags[i] ?? 'h2', text }));
-  const structure = structureOf({ headings, actions: snap.actions, formFields: snap.formFields, dialog: snap.dialog, selectedTabs: snap.selectedTabs }, snap.url, ctx, r);
-  return { signature: sha1(`${r.route}||${structure}`).slice(0, 12), route: r.route, dataValues: r.dataValues, structure };
+  const a = analyzePage({ headings, actions: snap.actions, formFields: snap.formFields, dialog: snap.dialog, selectedTabs: snap.selectedTabs }, snap.url, ctx, r);
+  return { signature: sha1(`${r.route}||${a.structure}`).slice(0, 12), route: r.route, dataValues: a.values, fold: a.fold, structure: a.structure };
+}
+
+/** 骨格の行を、ダイアログ・選ばれたタブ・見出しと、それ以外（操作・入力欄）に分ける */
+function splitLines(structure: string): { d: string[]; t: string[]; h: string[]; rest: string[] } {
+  const out = { d: [] as string[], t: [] as string[], h: [] as string[], rest: [] as string[] };
+  for (const line of structure.split('\n')) {
+    if (!line) continue;
+    const k = line.slice(0, 2);
+    if (k === 'd:') out.d.push(line);
+    else if (k === 't:') out.t.push(line);
+    else if (k === 'h:') out.h.push(line);
+    else out.rest.push(line);
+  }
+  return out;
+}
+
+const sameLines = (a: string[], b: string[]): boolean => a.length === b.length && a.every((x) => b.includes(x));
+
+/** その場の変化とみなすとき、元の画面の操作と入力欄のうち残っていなければならない割合 */
+export const LOCAL_RETAIN = 0.8;
+
+/**
+ * to が from の画面の中の変化か（DESIGN.md §4。ルートが同じことは呼び出し側で確かめる）。
+ * ダイアログと選ばれたタブが同じで、元の見出しを 1 つも失わず、元の操作と入力欄の retain 以上が残っているもの。
+ * 比較パネルへの追加・開閉を開く・並べ替え・その場のページ送りのように、画面はそのままで一部が増えたり変わったりした状態で、
+ * 別のノードにせず元の画面に吸収する。ダイアログ（モーダル）とタブの切り替えは別の画面として残す。
+ */
+export function isLocalChange(from: string, to: string, retain = LOCAL_RETAIN): boolean {
+  const A = splitLines(from);
+  const B = splitLines(to);
+  if (!A.h.length && !A.rest.length) return false;
+  if (!sameLines(A.d, B.d) || !sameLines(A.t, B.t)) return false;
+  const bh = new Set(B.h);
+  if (!A.h.every((x) => bh.has(x))) return false;
+  if (!A.rest.length) return true;
+  const br = new Set(B.rest);
+  return A.rest.filter((x) => br.has(x)).length >= A.rest.length * retain;
+}
+
+/**
+ * variant が base に「部品」（どこかの画面でその場の変化として現れた行）が加わっただけの状態か。
+ * 比較パネルのようにストレージに残って他の画面にも出る部品が開いた状態を、元の画面と同じとみなすのに使う。
+ * 部品として見たことのない行（カートの「購入手続きへ」など）が 1 つでも増えていれば別の画面とする
+ */
+export function variantOf(base: string, variant: string, isWidget: (line: string) => boolean): boolean {
+  if (!isLocalChange(base, variant, 0.9)) return false;
+  const A = new Set(base.split('\n'));
+  const extra = variant.split('\n').filter((x) => x && !A.has(x));
+  return extra.length > 0 && extra.every(isWidget);
+}
+
+/**
+ * 骨格の行の一覧から、ある行がそのどれかに当たるかを調べる関数を作る。
+ * 行の中の * （消したデータ）は 1 文字以上の任意の文字列に当たる。別の画面では同じ企業名がデータとして消えないことがあるため
+ */
+export function lineMatcher(lines: Iterable<string>): (line: string) => boolean {
+  const exact = new Set<string>();
+  const patterns: RegExp[] = [];
+  const escape = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  for (const l of lines) {
+    exact.add(l);
+    const head = /^(a:[^|]*\||h:[^:]*:|[dtf]:)/.exec(l)?.[0];
+    if (!head) continue;
+    const body = l.slice(head.length);
+    if (!body.includes('*') || body.replace(/\*/g, '').trim().length < 2) continue;
+    patterns.push(new RegExp('^' + escape(head) + body.split('*').map(escape).join('.+') + '$'));
+  }
+  return (line) => exact.has(line) || patterns.some((re) => re.test(line));
 }
 
 /** 2 つの骨格の違い（人が読む用）。再現した画面が元と違ったときや、なぜ別の画面になったかの説明に使う */

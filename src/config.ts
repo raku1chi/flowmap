@@ -23,7 +23,8 @@ export const DEFAULT_CONFIG: FlowmapConfig = {
   actionTimeoutMs: 5000,
   navigationTimeoutMs: 20000,
   useBackNavigation: true,
-  followExternalLinks: true,
+  followExternalLinks: false,
+  absorbLocalChanges: true,
   viewport: { width: 1280, height: 800 },
   fullPageScreenshots: false,
   locale: 'ja-JP',
@@ -156,6 +157,7 @@ const SPEC: Record<keyof FlowmapConfig, Spec> = {
   navigationTimeoutMs: int(1000, 300000),
   useBackNavigation: { t: 'boolean' },
   followExternalLinks: { t: 'boolean' },
+  absorbLocalChanges: { t: 'boolean' },
   viewport: { t: 'object', fields: { width: int(200, 10000), height: int(200, 10000) } },
   fullPageScreenshots: { t: 'boolean' },
   locale: { t: 'string' },
@@ -361,7 +363,7 @@ export function configSummary(config: FlowmapConfig): Record<string, unknown> {
   const pick = <K extends keyof FlowmapConfig>(...keys: K[]) => Object.fromEntries(keys.map((k) => [k, config[k]]));
   return {
     ...pick('maxStates', 'maxDepth', 'maxActionsPerState', 'maxActionsPerPattern', 'maxLocalActionRepeats', 'maxLinkRepeats',
-      'workers', 'useBackNavigation', 'followExternalLinks', 'allowSubmit', 'queryParams', 'structuralParams', 'dataParams',
+      'workers', 'useBackNavigation', 'followExternalLinks', 'absorbLocalChanges', 'allowSubmit', 'queryParams', 'structuralParams', 'dataParams',
       'pathRules', 'autoPathRules', 'autoPathRulesMinSiblings', 'volatileSelectors', 'viewport', 'locale', 'timezoneId'),
     authenticated: !!config.storageState,
     jev: config.jev.enabled,

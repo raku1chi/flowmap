@@ -81,8 +81,9 @@ export function computeDiff(graph: Graph, runDir: string, base: BaselineRef): Di
     if (p.signature === n.signature && p.textHash !== n.textHash) changed.push(n.id);
     if (!external && n.consoleErrors.some((e) => !p.consoleErrors.includes(e))) newErrors.push(n.id);
   }
+  // 外部サイトは消失に数えない（撮影するかは設定次第で、行き先の URL も相手の都合で変わる）
   const removed: RemovedNode[] = prev.nodes
-    .filter((p) => !sigsOf(p).some((sig) => curSigs.has(sig)))
+    .filter((p) => !(prev.meta.schemaVersion !== undefined && !p.route) && !sigsOf(p).some((sig) => curSigs.has(sig)))
     .map((p) => ({ url: p.url, title: p.title, signature: p.signature, screenshot: shotOf(p) }));
 
   const warnings: string[] = [];
@@ -96,6 +97,12 @@ export function computeDiff(graph: Graph, runDir: string, base: BaselineRef): Di
   if (!!prev.meta.jev !== !!graph.meta.jev) {
     unreliable = true;
     warnings.push(`比較対象と Jev の設定が違います（前回 ${prev.meta.jev ? 'あり' : 'なし'}・今回 ${graph.meta.jev ? 'あり' : 'なし'}）。合流のしかたが変わるので、消失と追加は設定の違いによるものを含みます`);
+  }
+  const prevAbsorb = prev.meta.config?.absorbLocalChanges ?? false;
+  const curAbsorb = graph.meta.config?.absorbLocalChanges ?? false;
+  if (prevAbsorb !== curAbsorb) {
+    unreliable = true;
+    warnings.push(`比較対象と「その場の変化」の扱いが違います（前回 ${prevAbsorb ? '吸収' : '別の画面'}・今回 ${curAbsorb ? '吸収' : '別の画面'}）。消失と追加は設定の違いによるものを含みます`);
   }
   if (graph.meta.stopKind && graph.meta.stopKind !== 'maxStates') {
     unreliable = true;

@@ -9,6 +9,10 @@
 //
 // 同じ画面を何度も辿らないために、共通の操作（ヘッダのリンクや開閉）は別々の画面から数回試して結果が毎回同じなら、
 // 以後の画面では押さずに辺を推定するか（リンク）、省く（その場の開閉）。
+//
+// 画面の中で完結する変化（比較パネルへの追加・開閉・並べ替え）は別の画面にせず、元の画面に吸収して「この画面の中の操作」として
+// 記録する。変化で新しく現れた操作（「比較ページで開く」）は、元の画面から「並べる → 比較ページで開く」と続けて押して探索する。
+// 変化で現れた部品（比較パネル）がストレージに残って他の画面にも出るときは、部品を除けば同じ既存の画面に合流させる。
 
 import { chromium, type Browser } from 'playwright';
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
@@ -18,9 +22,12 @@ import { computeDiff, findBaseline, type BaselineRef } from './diff.js';
 import type { RawAction, Snapshot } from './inpage.js';
 import { clip, JevJudge, maskedPath } from './jev.js';
 import { maskUrl, maskUrlsInText, paramMatcher } from './mask.js';
-import { actionKey, normalizeDigits, planActions, proposeDataSegments, sha1, signatureOf, structureDiff, type NormalizeContext, type SignatureResult } from './normalize.js';
+import {
+  actionKey, isLocalChange, labelKey, lineMatcher, planActions, proposeDataSegments, proposeQueryVariantPaths, sha1, signatureOf, structureDiff, variantOf,
+  type NormalizeContext, type SignatureResult,
+} from './normalize.js';
 import { ActionError, describeAction, PROFILE, Session, type StorageStateObject } from './session.js';
-import { SCHEMA_VERSION, SIGNATURE_VERSION, type ActionDesc, type Edge, type FlowmapConfig, type Graph, type RunStats, type StateNode } from './types.js';
+import { SCHEMA_VERSION, SIGNATURE_VERSION, type ActionDesc, type Edge, type FlowmapConfig, type Graph, type LocalAction, type RunStats, type StateNode } from './types.js';
 
 export class ExploreError extends Error {
   constructor(message: string, readonly kind: 'browser' | 'unreachable' | 'auth' | 'baseline' | 'storage' | 'jev') {
@@ -51,6 +58,16 @@ interface Planned {
   action: ActionDesc;
   /** 共通の操作として数えるキー（推定・省略の対象になるもの）。対象外なら undefined */
   key?: string;
+  /** 先に押す、その場の変化を起こす操作（元の画面から順に）。変化で現れた action を押すために通る */
+  via?: ActionDesc[];
+  /** この画面の同じ形の操作の 1 件目（`ノード|形`）。結果を 2 件目以降の判断に使う */
+  fam?: string;
+  /** この画面の同じ形の操作の 2 件目以降。1 件目がその場の変化だったら押さない */
+  dupOf?: string;
+  /** 変化で現れた操作を選ぶときに除く操作の形（元の画面と、途中の状態にあったもの） */
+  seen?: Set<string>;
+  /** 続けて押す操作の組の形（`途中の操作の形>操作の形`）。結果がその場の変化だけなら、他の画面では同じ組を押さない */
+  ckey?: string;
 }
 
 interface Outcome {
@@ -66,8 +83,8 @@ interface Outcome {
 }
 
 interface Task {
-  /** A: 先に試す操作 / B: 保留した共通の操作のうち、結果がばらついたので試すもの */
-  phase: 'A' | 'B';
+  /** A: 先に試す操作 / B: 保留した共通の操作のうち、結果がばらついたので試すもの / C: その場の変化で現れた操作 */
+  phase: 'A' | 'B' | 'C';
   seq: number;
   node: string;
   path: ActionDesc[];
@@ -91,6 +108,18 @@ const NAV_FAILURE_LIMIT = 5;
 const LOGIN_REPEAT_LIMIT = 3;
 /** Jev の操作判定で、リンク（GET の遷移）を止める閾値。ボタンなどは設定の jev.actionThreshold */
 const LINK_ACTION_THRESHOLD = 0.7;
+/** その場の変化を続けて起こす段数の上限（「メニュー → サブメニュー → リンク」の 2 段まで） */
+const MAX_VIA = 2;
+/** 1 回のその場の変化で現れた操作のうち、続けて押す数の上限 */
+const MAX_REVEALED = 8;
+/** 1 画面に記録する「この画面の中の操作」の上限 */
+const MAX_LOCAL_ACTIONS = 30;
+/** 1 画面に覚えておく、吸収した状態の数（同じ状態に着いたら元の画面とすぐ分かるように） */
+const MAX_LOCAL_REPS = 20;
+/** 部品（その場の変化で現れた行）を学ぶ元にする変化の数の上限 */
+const MAX_WIDGET_PAIRS = 200;
+/** 1 画面に記録する外部リンクの上限 */
+const MAX_EXTERNAL_LINKS = 30;
 
 const EMPTY_ERRORS = () => ({ consoleErrors: [] as string[], failedRequests: [] as string[] });
 const firstLine = (e: unknown): string => String((e as Error)?.message ?? e).split('\n')[0];
@@ -152,6 +181,24 @@ class Explorer {
   private rejected = new Set<string>();
   private warned = new Set<string>();
   private headed = new Set<string>();
+  /** 学習したクエリ違いの一覧のルート（graph.json の meta に残す） */
+  private learnedQueryVariants: string[] = [];
+  /** 吸収したその場の変化の状態（ノード → 代表のスナップショット）。学習でシグネチャを計算し直すときに索引へ入れ直す */
+  private localReps = new Map<string, Rep[]>();
+  /** 吸収したその場の変化の前後。変化で現れた行（部品）を学ぶのに使う */
+  private widgetPairs: { from: Rep; to: Rep }[] = [];
+  private widgetCache?: (line: string) => boolean;
+  /** その場の変化で現れた、続けて押す操作（深さ 1 段の中の画面 id → 操作） */
+  private compounds = new Map<string, Planned[]>();
+  private compoundKeys = new Map<string, Set<string>>();
+  private compoundCount = new Map<string, number>();
+  private compoundCut = new Map<string, number>();
+  /** 同じ画面の同じ形の操作の 1 件目の結果（その場の変化だったか） */
+  private famOutcome = new Map<string, 'local' | 'other'>();
+  /** 続けて押した結果がその場の変化だけだった操作の組（`途中の操作の形>操作の形`）。他の画面では押さない */
+  private localCompounds = new Set<string>();
+  /** シグネチャの計算結果。学習で正規化が変わったら作り直す */
+  private sigCache = new WeakMap<object, SignatureResult>();
   private nextLevel: string[] = [];
   private sessions: Session[] = [];
   private nextId = 1;
@@ -179,8 +226,12 @@ class Explorer {
       queryParams: config.queryParams,
       structuralParams: config.structuralParams,
       dataParams: config.dataParams,
+      queryVariantPaths: new Set<string>(),
     };
-    this.stats = { attempts: 0, replays: 0, backReturns: 0, inferredEdges: 0, skippedCommon: 0, replayDrift: 0, workers: config.workers, durationMs: 0 };
+    this.stats = {
+      attempts: 0, replays: 0, backReturns: 0, inferredEdges: 0, skippedCommon: 0, replayDrift: 0,
+      localChanges: 0, revealedTried: 0, variantJoins: 0, skippedRepeats: 0, workers: config.workers, durationMs: 0,
+    };
     if (config.loginUrlPattern) this.loginRe = new RegExp(config.loginUrlPattern, 'i');
   }
 
@@ -221,7 +272,34 @@ class Explorer {
     return this.lookup(sig) === this.resolve(nodeId);
   }
 
-  private sig(snap: Rep): SignatureResult { return signatureOf(snap, this.ctx); }
+  /**
+   * そのノードの画面そのもの（代表と同じシグネチャ）か。吸収したその場の変化の状態（開閉を開いたまま等）は含めない。
+   * 「戻る」や失敗した操作のあとで、次の操作をこの状態から続けてよいかの判定に使う
+   */
+  private isAt(sig: string, nodeId: string): boolean {
+    return this.byId.get(this.resolve(nodeId))?.signature === sig;
+  }
+
+  private sig(snap: Rep): SignatureResult {
+    let s = this.sigCache.get(snap);
+    if (!s) { s = signatureOf(snap, this.ctx); this.sigCache.set(snap, s); }
+    return s;
+  }
+
+  /** ノードの代表の画面のデータ（企業名などの値と、行ごとの操作を畳んだ形） */
+  private pageOf(id: string): SignatureResult | undefined {
+    const rep = this.reps.get(this.resolve(id));
+    return rep ? this.sig(rep) : undefined;
+  }
+
+  /** 吸収した状態を覚える。同じ状態に着いたら、元の画面の中の変化とすぐ分かる */
+  private addLocalRep(id: string, snap: Snapshot, sig: string): void {
+    if (!this.index.has(sig)) this.index.set(sig, id);
+    const reps = this.localReps.get(id) ?? [];
+    if (reps.length >= MAX_LOCAL_REPS) return;
+    reps.push({ ...snap, bodyText: '' });
+    this.localReps.set(id, reps);
+  }
 
   /**
    * データ区間を学習したら、既存のノードのシグネチャを新しい正規化で計算し直す。
@@ -229,6 +307,8 @@ class Explorer {
    * 計算し直して同じになったノードは、深さが同じなら合流させる（発見辺の木が崩れない）。深さが違えば両方残し、後のほうに印を付ける。
    */
   private rekey(): void {
+    this.sigCache = new WeakMap();
+    this.widgetCache = undefined;
     const next = new Map<string, string>();
     for (const n of [...this.nodes]) {
       const rep = this.reps.get(n.id);
@@ -252,6 +332,13 @@ class Explorer {
       for (const a of aliases) if (!next.has(a)) next.set(a, n.id);
       if (aliases.length) n.aliasSignatures = [...new Set(aliases)];
     }
+    // 吸収したその場の変化の状態は、どのノードの代表とも重ならないときだけ元の画面に結び付ける
+    for (const n of this.nodes) {
+      for (const r of this.localReps.get(n.id) ?? []) {
+        const sig = this.sig(r).signature;
+        if (!next.has(sig)) next.set(sig, n.id);
+      }
+    }
     this.index = next;
   }
 
@@ -274,6 +361,17 @@ class Explorer {
       for (const s of [{ url: readableUrl(n.url), title: n.title, heading: n.headings[0] }, ...(n.samples ?? [])]) if (!samples.some((x) => x.url === s.url) && samples.length < MAX_SAMPLES) samples.push(s);
     }
     m.actionsTried += n.actionsTried;
+    for (const l of n.localActions ?? []) {
+      const list = m.localActions ?? (m.localActions = []);
+      if (!list.some((x) => x.key === l.key) && list.length < MAX_LOCAL_ACTIONS) list.push(l);
+    }
+    for (const l of n.externalLinks ?? []) {
+      const list = m.externalLinks ?? (m.externalLinks = []);
+      if (!list.some((x) => x.href === l.href) && list.length < MAX_EXTERNAL_LINKS) list.push(l);
+    }
+    const moved = [...(this.localReps.get(m.id) ?? []), ...(this.localReps.get(n.id) ?? [])].slice(0, MAX_LOCAL_REPS);
+    if (moved.length) this.localReps.set(m.id, moved);
+    this.localReps.delete(n.id);
     this.nodes.splice(this.nodes.indexOf(n), 1);
     this.byId.delete(n.id);
     this.redirects.set(n.id, m.id);
@@ -309,12 +407,33 @@ class Explorer {
       changed = true;
       this.say(`   ≈ データ区間を学習: ${p.prefix}/* （同じ形のリンクが ${this.config.autoPathRulesMinSiblings} 本以上）`);
     }
+    for (const route of proposeQueryVariantPaths(items, snap.url, this.ctx)) {
+      this.ctx.queryVariantPaths!.add(route);
+      this.learnedQueryVariants.push(route);
+      changed = true;
+      this.say(`   ≈ クエリで絞り込む一覧を学習: ${route} （クエリだけ違うリンクが 2 通り以上。見出しの違いをデータとみなす）`);
+    }
     if (changed) this.rekey();
   }
 
   // ---------- ノード ----------
 
-  private createNode(o: Outcome, from: string | undefined, path: ActionDesc[], depth: number): StateNode {
+  /** 別オリジンへの http(s) リンクか */
+  private isExternalLink(a: { href?: string }, base: string): boolean {
+    if (!isHttp(a.href, base)) return false;
+    try { return new URL(a.href!, base).origin !== this.ctx.origin; } catch { return false; }
+  }
+
+  /** 探索する操作（別オリジンへのリンクは followExternalLinks のときだけ） */
+  private enumerable(snap: Snapshot): ActionDesc[] {
+    return snap.actions.filter((a) => this.config.followExternalLinks || !this.isExternalLink(a, snap.url)).map(toDesc);
+  }
+
+  /**
+   * 新しいノードを作る。steps は親の画面からここまでに押した操作（その場の変化を起こす操作を含む）。
+   * 押した操作に状態を変えるもの（ボタン・送信）があるか、ストレージが変わっていれば、この画面は「きれい」でない
+   */
+  private createNode(o: Outcome, from: string | undefined, path: ActionDesc[], depth: number, steps: ActionDesc[] = []): StateNode {
     const snap = o.snap!;
     const id = `s${String(this.nextId++).padStart(3, '0')}`;
     const s = this.sig(snap);
@@ -326,10 +445,8 @@ class Explorer {
       screenshot = '';
       this.warnOnce(`noshot:${id}`, `   ! [${id}] のスクリーンショットがありません`);
     }
-    const enumerated = sameOrigin
-      ? snap.actions.filter((a) => this.config.followExternalLinks || !isHttp(a.href, snap.url) || new URL(a.href!, snap.url).origin === this.ctx.origin).map(toDesc)
-      : [];
-    const planned = planActions(enumerated, (a) => actionKey(a, snap.url, this.ctx, s.dataValues), this.config.maxActionsPerPattern);
+    const enumerated = sameOrigin ? this.enumerable(snap) : [];
+    const planned = planActions(enumerated, (a) => actionKey(a, snap.url, this.ctx, s.dataValues, s.fold), this.config.maxActionsPerPattern);
     const node: StateNode = {
       id,
       signature: s.signature,
@@ -348,17 +465,27 @@ class Explorer {
     };
     if (snap.dialog !== undefined) node.dialog = snap.dialog;
     if (snap.expanded?.length) node.expanded = snap.expanded.slice(0, 4);
+    if (sameOrigin && !this.config.followExternalLinks) {
+      const links: { label: string; href: string }[] = [];
+      for (const a of snap.actions) {
+        if (!this.isExternalLink(a, snap.url)) continue;
+        const href = new URL(a.href!, snap.url).href;
+        if (!links.some((l) => l.href === href) && links.length < MAX_EXTERNAL_LINKS) links.push({ label: a.label, href });
+      }
+      if (links.length) node.externalLinks = links;
+    }
     if (!sameOrigin) node.truncated = '外部サイト';
     else if (depth >= this.config.maxDepth) node.truncated = '深さ上限';
     this.nodes.push(node);
     this.byId.set(id, node);
     this.index.set(s.signature, id);
-    this.reps.set(id, { ...snap, bodyText: '' });
+    const rep = { ...snap, bodyText: '' };
+    this.reps.set(id, rep);
+    this.sigCache.set(rep, s);
     this.paths.set(id, path);
     this.plans.set(id, planned.map((action) => ({ action })));
     const parentDirty = from ? this.dirty.get(this.resolve(from)) ?? false : false;
-    const last = path[path.length - 1];
-    this.dirty.set(id, parentDirty || (last ? !isCleanAction(last) : false) || !!o.storageChanged);
+    this.dirty.set(id, parentDirty || steps.some((a) => !isCleanAction(a)) || !!o.storageChanged);
     if (!node.truncated) this.nextLevel.push(id);
     return node;
   }
@@ -406,23 +533,31 @@ class Explorer {
   private async jevFilter(node: StateNode): Promise<void> {
     const plan = this.plans.get(node.id);
     if (!this.judge || !this.config.jev.actions || node.truncated || !plan?.length) return;
-    // タブと開閉は表示を切り替えるだけなので聞かない。リンクは GET の遷移なので閾値を上げる（DESIGN.md §5）
-    const uiOnly = (a: ActionDesc) => a.role === 'tab' || a.role === 'summary' || !!a.toggle;
-    const scores = await Promise.all(plan.map((p) => (uiOnly(p.action) ? Promise.resolve(undefined) : this.judge!.actionScore(node.title, p.action))));
-    const skipped: { role: string; label: string; score: number }[] = [];
-    const kept = plan.filter((p, i) => {
-      const score = scores[i];
-      const threshold = p.action.role === 'link' ? Math.max(this.config.jev.actionThreshold, LINK_ACTION_THRESHOLD) : this.config.jev.actionThreshold;
-      if (score === undefined || score < threshold) return true;
-      skipped.push({ role: p.action.role, label: p.action.label, score: round2(score) });
-      return false;
-    });
-    if (!skipped.length) return;
+    const kept = await this.jevScreen(node, plan);
+    if (kept.length === plan.length) return;
     this.plans.set(node.id, kept);
     node.actionsPlanned = kept.length;
-    node.jevSkipped = skipped;
-    this.jevCounts.skippedActions += skipped.length;
-    for (const k of skipped) this.say(`   ⊘ Jev が危険と判定して押しません: ${describeAction({ ...k, nth: 1 })} （${k.score.toFixed(2)}）`);
+  }
+
+  /**
+   * Jev で危険と判定した操作を除き、除いたものはノードに記録する。画面の操作の計画と、その場の変化で現れた操作（パネルやメニューの中）の両方に使う。
+   * タブと開閉は表示を切り替えるだけなので聞かない。リンクは GET の遷移なので閾値を上げる（DESIGN.md §5）
+   */
+  private async jevScreen(node: StateNode, items: Planned[]): Promise<Planned[]> {
+    if (!this.judge || !this.config.jev.actions || !items.length) return items;
+    const uiOnly = (a: ActionDesc) => a.role === 'tab' || a.role === 'summary' || !!a.toggle;
+    const scores = await Promise.all(items.map((p) => (uiOnly(p.action) ? Promise.resolve(undefined) : this.judge!.actionScore(node.title, p.action))));
+    const kept: Planned[] = [];
+    items.forEach((p, i) => {
+      const score = scores[i];
+      const threshold = p.action.role === 'link' ? Math.max(this.config.jev.actionThreshold, LINK_ACTION_THRESHOLD) : this.config.jev.actionThreshold;
+      if (score === undefined || score < threshold) { kept.push(p); return; }
+      const k = { role: p.action.role, label: p.action.label, score: round2(score) };
+      (node.jevSkipped ??= []).push(k);
+      this.jevCounts.skippedActions++;
+      this.say(`   ⊘ Jev が危険と判定して押しません: ${describeAction({ ...k, nth: 1 })} （${k.score.toFixed(2)}）`);
+    });
+    return kept;
   }
 
   // ---------- 共通の操作 ----------
@@ -431,10 +566,19 @@ class Explorer {
    * 共通の操作として数えるキー。リンクは行き先の正規化ルート、それ以外は役割とラベル（数字は潰す）。
    * データを変えうる送信は対象にしない（検索フォームは除く）。
    */
-  private commonKey(a: ActionDesc, pageUrl: string): string | undefined {
+  private commonKey(a: ActionDesc, pageUrl: string, page?: SignatureResult): string | undefined {
     if (a.kind === 'submit' && !a.search) return undefined;
     if (isHttp(a.href, pageUrl)) return 'L|' + actionKey(a, pageUrl, this.ctx, []);
-    return `C|${a.role}|${normalizeDigits(a.label)}${a.kind === 'submit' ? '|submit' : ''}`;
+    return `C|${this.familyOf(a, pageUrl, page)}`;
+  }
+
+  /**
+   * 同じ画面の中で「同じ形」とみなす操作のキー（リンク以外）。ラベルの数字とデータ（企業名など）を潰し、
+   * 行ごとの同種のボタン（「〇〇を並べて比べる」）は 1 つの形になる。開閉もラベルで区別する
+   */
+  private familyOf(a: ActionDesc, pageUrl: string, page?: SignatureResult): string | undefined {
+    if (isHttp(a.href, pageUrl)) return undefined;
+    return `${a.role}|${labelKey(a, page?.dataValues ?? [], page?.fold)}${a.kind === 'submit' ? '|submit' : ''}`;
   }
 
   /** 共通の操作を別々の画面から試す回数。開閉（summary・aria-expanded など）は性質上その場の変化なので 1 回で見極める */
@@ -489,12 +633,21 @@ class Explorer {
       const node = this.byId.get(id);
       if (!node || node.truncated) continue;
       const clean = !this.dirty.get(id);
+      const page = this.pageOf(id);
       const run: Planned[] = [];
       const later: Planned[] = [];
+      const families = new Set<string>();
       let budget = this.config.maxActionsPerState;
       let cut = 0;
       for (const p of this.plans.get(id) ?? []) {
-        p.key = clean ? this.commonKey(p.action, node.url) : undefined;
+        p.key = clean ? this.commonKey(p.action, node.url, page) : undefined;
+        // 同じ画面の同じ形の操作（一覧の各行のボタン）は 1 件目だけ先に試し、残りは 1 件目の結果を見てから決める
+        const fam = this.config.absorbLocalChanges ? this.familyOf(p.action, node.url, page) : undefined;
+        if (fam) {
+          if (families.has(fam)) { p.dupOf = `${id}|${fam}`; later.push(p); continue; }
+          families.add(fam);
+          p.fam = `${id}|${fam}`;
+        }
         const R = p.key ? this.repeatsFor(p) : 0;
         if (p.key && R > 0) {
           const st = this.common.get(p.key) ?? { sources: new Set<string>(), outcomes: [] };
@@ -526,8 +679,18 @@ class Explorer {
       let budget = this.config.maxActionsPerState - (this.runCount.get(id) ?? 0);
       let inferred = 0;
       let skipped = 0;
+      let repeats = 0;
       const run: Planned[] = [];
       for (const p of later) {
+        if (p.dupOf) {
+          const f = this.famOutcome.get(p.dupOf);
+          if (f === 'local') { repeats++; continue; } // 1 件目がその場の変化だった。残りの行も同じとみなす
+          // 1 件目も共通の操作として保留されていれば、共通の操作の結果に従う（下）
+          if (f !== undefined || !p.key) {
+            if (budget > 0) { run.push(p); budget--; } else this.cut.set(id, (this.cut.get(id) ?? 0) + 1);
+            continue;
+          }
+        }
         const c = this.consistency(p.key!);
         if (c === 'local') { skipped++; continue; }
         if (c) {
@@ -541,8 +704,34 @@ class Explorer {
       if (skipped) node.actionsSkippedCommon = (node.actionsSkippedCommon ?? 0) + skipped;
       this.stats.inferredEdges += inferred;
       this.stats.skippedCommon += skipped;
+      this.stats.skippedRepeats = (this.stats.skippedRepeats ?? 0) + repeats;
       if (inferred || skipped) this.say(`   ⇢ [${N}] 共通の操作: 推定 ${inferred} 件・省略 ${skipped} 件${run.length ? `・試行 ${run.length} 件` : ''}（他の画面で結果を確かめ済み）`);
+      if (repeats) this.say(`   ⇢ [${N}] 同じ形の操作 ${repeats} 件は、1 件目がこの画面の中の変化だったので押しません`);
       for (let i = 0; i < run.length; i += CHUNK) tasks.push({ phase: 'B', seq: tasks.length, node: id, path: this.paths.get(id)!, items: run.slice(i, i + CHUNK) });
+    }
+    return tasks;
+  }
+
+  /**
+   * その場の変化で現れた操作を、元の画面から続けて押す試行にする。深さ 1 段の中で、変化を見つけた順（決まった順番）に並ぶ。
+   * 1 画面あたり maxActionsPerState 件まで
+   */
+  private planCompounds(ids: string[]): Task[] {
+    const tasks: Task[] = [];
+    for (const id of ids) {
+      const list = this.compounds.get(id);
+      if (!list?.length) continue;
+      this.compounds.delete(id);
+      if (!this.byId.has(this.resolve(id))) continue;
+      let used = this.compoundCount.get(id) ?? 0;
+      const run: Planned[] = [];
+      for (const p of list) {
+        if (used >= this.config.maxActionsPerState) { this.compoundCut.set(id, (this.compoundCut.get(id) ?? 0) + 1); continue; }
+        run.push(p);
+        used++;
+      }
+      this.compoundCount.set(id, used);
+      for (let i = 0; i < run.length; i += CHUNK) tasks.push({ phase: 'C', seq: tasks.length, node: id, path: this.paths.get(id)!, items: run.slice(i, i + CHUNK) });
     }
     return tasks;
   }
@@ -621,7 +810,7 @@ class Explorer {
   private async stillAt(s: Session, node: string, digest: string): Promise<boolean> {
     try {
       const snap = await s.snapshot();
-      return this.belongsTo(this.sig(snap).signature, node) && (await s.storageDigest()) === digest;
+      return this.isAt(this.sig(snap).signature, node) && (await s.storageDigest()) === digest;
     } catch {
       return false;
     }
@@ -645,6 +834,17 @@ class Explorer {
         }
         atSource = false;
         s.drain(); // 再現中のエラーは元の画面のもの
+        if (item.via) {
+          // その場の変化を起こす操作を先に押す（変化のエラーは、その変化を最初に試したときに記録済み）
+          try {
+            for (const step of item.via) await s.perform(step);
+          } catch (e) {
+            out.push({ error: `途中の操作に失敗: ${firstLine(e)}`, kind: 'replay', errors: EMPTY_ERRORS(), drift });
+            drift = undefined;
+            continue;
+          }
+          s.drain();
+        }
         const beforeUrl = s.url();
         this.stats.attempts++;
         let settled: boolean;
@@ -668,14 +868,15 @@ class Explorer {
         const storageChanged = (await s.storageDigest()) !== sourceDigest;
         out.push({ snap, shot, errors, storageChanged, drift, substituted });
         drift = undefined;
-        // 元の画面に戻れるなら戻り、次の操作の再現を省く。正しさはシグネチャとストレージの一致で確かめる
+        // 元の画面に戻れるなら戻り、次の操作の再現を省く。正しさはシグネチャとストレージの一致で確かめる。
+        // 吸収したその場の変化の状態（開閉を開いたまま）は元の画面そのものではないので、ここでは代表との一致だけを見る
         if (storageChanged) continue;
-        if (this.belongsTo(sig, task.node) && s.url() === beforeUrl) { atSource = true; continue; } // 画面が変わらなかった
+        if (this.isAt(sig, task.node) && s.url() === beforeUrl) { atSource = true; continue; } // 画面が変わらなかった
         if (this.config.useBackNavigation && isCleanAction(item.action) && item.action.href && s.url() !== beforeUrl) {
           const b = await s.goBack();
           if (b.moved) {
             const back = await s.stableSnapshot(b.settled);
-            if (this.belongsTo(this.sig(back).signature, task.node) && (await s.storageDigest()) === sourceDigest) {
+            if (this.isAt(this.sig(back).signature, task.node) && (await s.storageDigest()) === sourceDigest) {
               atSource = true;
               this.stats.backReturns++;
             }
@@ -695,17 +896,171 @@ class Explorer {
     if (this.headed.has(key)) return;
     this.headed.add(key);
     const n = this.byId.get(id);
-    if (n) this.say(`[${n.id}] ${n.title || n.url}  深さ ${n.depth}${phase === 'B' ? '（保留した共通の操作）' : ''}`);
+    const note = phase === 'B' ? '（保留した共通の操作）' : phase === 'C' ? '（この画面の中の変化で現れた操作）' : '';
+    if (n) this.say(`[${n.id}] ${n.title || n.url}  深さ ${n.depth}${note}`);
+  }
+
+  /** 操作の説明。その場の変化を経る操作は「並べる → 比較ページで開く」 */
+  private describe(item: Planned): string {
+    return [...(item.via ?? []), item.action].map(describeAction).join(' → ');
+  }
+
+  private edgeOf(from: string, to: string, item: Planned, extra: Partial<Edge> = {}): Edge {
+    return { from, to, action: item.action, ...(item.via ? { via: item.via } : {}), ...extra };
+  }
+
+  private addErrors(n: StateNode, errors: Outcome['errors']): void {
+    for (const e of errors.consoleErrors) if (!n.consoleErrors.includes(e)) n.consoleErrors.push(e);
+    for (const f of errors.failedRequests) if (!n.failedRequests.includes(f)) n.failedRequests.push(f);
+  }
+
+  private checkLogin(item: Planned, snap: Snapshot): void {
+    if (!this.loginRe) return;
+    const aimedAtLogin = !!item.action.href && this.loginRe.test(item.action.href);
+    if (this.loginRe.test(snap.url) && !aimedAtLogin) {
+      if (++this.loginHits >= LOGIN_REPEAT_LIMIT) this.halt('auth', `ログイン画面（${readableUrl(snap.url)}）に ${LOGIN_REPEAT_LIMIT} 回続けて移りました。認証が切れています。storageState を取り直してください`);
+    } else this.loginHits = 0;
+  }
+
+  // ---------- この画面の中の変化 ----------
+
+  /**
+   * 変化で現れた行（部品）に当たるか。吸収したその場の変化の前後の骨格の差から作る。
+   * 元の画面に同じ形があった操作でも、変化で新しく増えたもの（比較パネルの「詳しく見る」リンク）は部品の行に入れる。
+   * 部品が別の画面に出たとき、その画面には同じ形のリンクが無いことがあるため
+   */
+  private widgetMatcher(): (line: string) => boolean {
+    if (!this.widgetCache) {
+      const lines = new Set<string>();
+      const instance = (a: RawAction) => `${a.role}|${a.label}|${a.href ?? ''}`;
+      for (const w of this.widgetPairs) {
+        const to = this.sig(w.to);
+        const before = new Set(this.sig(w.from).structure.split('\n'));
+        for (const l of to.structure.split('\n')) if (l && !before.has(l)) lines.add(l);
+        const count = new Map<string, number>();
+        for (const a of w.from.actions) count.set(instance(a), (count.get(instance(a)) ?? 0) + 1);
+        for (const a of w.to.actions) {
+          const c = count.get(instance(a)) ?? 0;
+          if (c > 0) { count.set(instance(a), c - 1); continue; }
+          if (!a.volatile) lines.add(`a:${actionKey(a, w.to.url, this.ctx, to.dataValues, to.fold)}`);
+        }
+      }
+      this.widgetCache = lineMatcher(lines);
+    }
+    return this.widgetCache;
+  }
+
+  /**
+   * 部品（比較パネルなど、その場の変化で現れたことのある行）が開いたままなだけで、中身は既存の画面と同じなら、その画面を返す。
+   * ストレージに残った部品が他の画面にも出て、同じ画面が「部品あり」「部品なし」に分かれるのを防ぐ
+   */
+  private findVariantBase(s: SignatureResult): StateNode | undefined {
+    if (!this.widgetPairs.length || !s.route) return undefined;
+    const isWidget = this.widgetMatcher();
+    for (const n of this.nodes) {
+      if (n.route !== s.route) continue;
+      const rep = this.reps.get(n.id);
+      if (rep && variantOf(this.sig(rep).structure, s.structure, isWidget)) return n;
+    }
+    return undefined;
+  }
+
+  /** 操作の形の一覧（変化で「新しく現れた」操作を選ぶのに使う） */
+  private keysOf(snap: Snapshot, page: SignatureResult): string[] {
+    return this.enumerable(snap).map((a) => actionKey(a, snap.url, this.ctx, page.dataValues, page.fold));
+  }
+
+  /**
+   * その場の変化で新しく現れた操作を、元の画面から続けて押す操作にする。元の画面（と途中の状態）に同じ形の操作があるもの、
+   * この画面で既に続けて押すことにしたものは除く。段数は MAX_VIA まで
+   */
+  private revealedFor(levelId: string, N: StateNode, item: Planned, snap: Snapshot, s: SignatureResult): Planned[] {
+    const via = [...(item.via ?? []), item.action];
+    const rep = this.reps.get(N.id);
+    const page = this.pageOf(N.id);
+    if (via.length > MAX_VIA || !rep || !page) return [];
+    const seen = item.seen ?? new Set(this.keysOf(rep, page));
+    const keyOf = (a: ActionDesc) => actionKey(a, snap.url, this.ctx, s.dataValues, s.fold);
+    const enumerated = this.enumerable(snap);
+    // 最後の段では開閉を押しても先が無いので、続けて押すのはリンクやボタンだけにする。
+    // この画面自身へのリンク（パネルの「詳しく見る」がこの画面を指すなど）は再表示にしかならないので押さない
+    const self = (a: ActionDesc) => !!a.href && keyOf(a) === `${a.role}|${N.route}`;
+    const fresh = planActions(enumerated.filter((a) => !seen.has(keyOf(a)) && !self(a) && !(via.length === MAX_VIA && a.toggle)), keyOf, 1);
+    const done = this.compoundKeys.get(levelId) ?? new Set<string>();
+    this.compoundKeys.set(levelId, done);
+    const next = new Set([...seen, ...enumerated.map(keyOf)]);
+    const viaKey = via.map((v) => this.familyOf(v, N.url, page) ?? actionKey(v, N.url, this.ctx, [])).join('>');
+    const out: Planned[] = [];
+    for (const a of fresh) {
+      const k = keyOf(a);
+      const ckey = `${viaKey}>${k}`;
+      if (done.has(k)) continue;
+      if (this.localCompounds.has(ckey)) { this.stats.skippedRepeats = (this.stats.skippedRepeats ?? 0) + 1; continue; }
+      if (out.length >= MAX_REVEALED) break;
+      done.add(k);
+      out.push({ action: a, via, seen: next, ckey });
+    }
+    return out;
+  }
+
+  /**
+   * 「この画面の中の操作」を記録する。同じ形の操作は 1 件にまとめ、変化のあとのスクリーンショットは形ごとに 1 枚だけ残す。
+   * 続けて押した操作（via あり）の結果と、変化のない同じ画面へのリンク（ページ送りなど）は載せない
+   */
+  private noteLocal(N: StateNode, item: Planned, changed: boolean, shot?: string, revealed: Planned[] = []): void {
+    if (item.via?.length) return;
+    if (!changed && isHttp(item.action.href, N.url)) return;
+    const page = this.pageOf(N.id);
+    const rep = this.reps.get(N.id);
+    // 開閉はラベルで区別する（actionKey は開閉のラベルを見ないので、別々の開閉が 1 つにまとまってしまう）
+    const groupOf = (a: ActionDesc) => (a.toggle ? `${a.role}|~${labelKey(a, page?.dataValues ?? [], page?.fold)}` : actionKey(a, N.url, this.ctx, page?.dataValues ?? [], page?.fold));
+    const key = groupOf(item.action);
+    const list = N.localActions ?? (N.localActions = []);
+    let e: LocalAction | undefined = list.find((x) => x.key === key);
+    if (!e) {
+      if (list.length >= MAX_LOCAL_ACTIONS) return;
+      const count = rep ? this.enumerable(rep).filter((a) => groupOf(a) === key).length : 1;
+      e = { key, action: item.action, count: Math.max(1, count), tried: 0, changed: false };
+      const lk = labelKey(item.action, page?.dataValues ?? [], page?.fold);
+      if (!item.action.href && !item.action.toggle && lk.includes('*')) e.pattern = lk;
+      list.push(e);
+    }
+    e.tried++;
+    if (changed) e.changed = true;
+    if (revealed.length && !e.revealed) e.revealed = revealed.map((r) => r.action.label).slice(0, MAX_REVEALED);
+    if (changed && shot && !e.screenshot && existsSync(shot)) {
+      const file = `shots/${N.id}-${list.indexOf(e) + 1}.png`;
+      renameSync(shot, join(this.runDir, file));
+      e.screenshot = file;
+    }
+  }
+
+  /** その場の変化を元の画面に吸収する。変化で現れた操作は、続けて押す操作として同じ深さの最後に試す */
+  private async absorb(levelId: string, N: StateNode, item: Planned, o: Outcome, s: SignatureResult): Promise<void> {
+    const snap = o.snap!;
+    this.stats.localChanges = (this.stats.localChanges ?? 0) + 1;
+    this.addErrors(N, o.errors);
+    this.addLocalRep(N.id, snap, s.signature);
+    const rep = this.reps.get(N.id);
+    if (rep && this.widgetPairs.length < MAX_WIDGET_PAIRS) {
+      this.widgetPairs.push({ from: rep, to: { ...snap, bodyText: '' } });
+      this.widgetCache = undefined;
+    }
+    const revealed = await this.jevScreen(N, this.revealedFor(levelId, N, item, snap, s));
+    if (revealed.length) this.compounds.set(levelId, [...(this.compounds.get(levelId) ?? []), ...revealed]);
+    this.noteLocal(N, item, true, o.shot, revealed);
+    this.say(`   ◇ ${this.describe(item)}: この画面の中の変化${revealed.length ? `（現れた操作 ${revealed.length} 件を続けて試す）` : ''}`);
   }
 
   /** 試行の結果を 1 つ取り込む。決まった順番で呼ばれる */
   private async mergeOutcome(task: Task, item: Planned, o: Outcome): Promise<void> {
     if (this.stop) return;
-    const N = this.resolve(task.node);
-    const node = this.byId.get(N);
+    let N = this.resolve(task.node);
+    let node = this.byId.get(N);
     if (!node) return;
     this.header(N, task.phase);
     node.actionsTried++;
+    if (item.via) this.stats.revealedTried = (this.stats.revealedTried ?? 0) + 1;
     if (o.drift) {
       const u = node.unstable ?? (node.unstable = { count: 0, onlyHere: o.drift.onlyHere, onlyReplayed: o.drift.onlyReplayed });
       u.count++;
@@ -713,9 +1068,10 @@ class Explorer {
       if (u.count === 1) this.say(`   ! [${N}] 起点から再現した画面が元と一致しません（元だけ: ${o.drift.onlyHere.slice(0, 3).join(' / ') || 'なし'}・再現だけ: ${o.drift.onlyReplayed.slice(0, 3).join(' / ') || 'なし'}）`);
     }
     if (o.error) {
-      this.edges.push({ from: N, to: N, action: item.action, error: o.error });
+      this.edges.push(this.edgeOf(N, N, item, { error: o.error }));
       this.record(N, item, 'error');
-      this.say(`   ✗ ${describeAction(item.action)}: ${o.error}`);
+      if (item.fam) this.famOutcome.set(item.fam, 'other');
+      this.say(`   ✗ ${this.describe(item)}: ${o.error}`);
       if (o.kind === 'navigation') {
         if (++this.navFailures >= NAV_FAILURE_LIMIT) this.halt('unreachable', `起点に ${NAV_FAILURE_LIMIT} 回続けて接続できませんでした（${o.error}）`);
       } else this.navFailures = 0;
@@ -725,8 +1081,30 @@ class Explorer {
     const snap = o.snap!;
     if (o.substituted) this.warnOnce(`sub:${N}:${item.action.label}`, `   ≒ ${describeAction(item.action)} が見つからないため、同じ形のリンクで代用しました`);
     await this.learnFrom(snap);
+    // 学習でノードが合流したかもしれないので引き直す
+    N = this.resolve(task.node);
+    node = this.byId.get(N);
+    if (!node) return;
     const s = this.sig(snap);
     let K = this.lookup(s.signature);
+    if (!K && s.route && this.config.absorbLocalChanges) {
+      const rep = this.reps.get(N);
+      if (rep && s.route === node.route && isLocalChange(this.sig(rep).structure, s.structure)) {
+        await this.absorb(task.node, node, item, o, s);
+        this.checkLogin(item, snap);
+        this.record(N, item, this.classify(N, N, item));
+        if (item.fam) this.famOutcome.set(item.fam, 'local');
+        if (item.ckey) this.localCompounds.add(item.ckey);
+        return;
+      }
+      const base = this.findVariantBase(s);
+      if (base) {
+        K = base.id;
+        this.addLocalRep(K, snap, s.signature);
+        this.stats.variantJoins = (this.stats.variantJoins ?? 0) + 1;
+        if (K !== N) this.say(`   ≈ 開いたままの部品（比較パネルなど）を除けば [${K}] と同じ画面`);
+      }
+    }
     let isNew = false;
     if (!K && this.judge && this.config.jev.pages && s.route) {
       const found = await this.findSameScreen(snap, s.route);
@@ -745,22 +1123,23 @@ class Explorer {
     if (K) {
       this.joinKnown(this.byId.get(K)!, snap, s, o.errors);
     } else {
-      const created = this.createNode(o, N, [...task.path, item.action], node.depth + 1);
+      const steps = [...(item.via ?? []), item.action];
+      const created = this.createNode(o, N, [...task.path, ...steps], node.depth + 1, steps);
       await this.jevFilter(created);
       K = created.id;
       isNew = true;
     }
-    if (this.loginRe) {
-      const aimedAtLogin = !!item.action.href && this.loginRe.test(item.action.href);
-      if (this.loginRe.test(snap.url) && !aimedAtLogin) {
-        if (++this.loginHits >= LOGIN_REPEAT_LIMIT) this.halt('auth', `ログイン画面（${readableUrl(snap.url)}）に ${LOGIN_REPEAT_LIMIT} 回続けて移りました。認証が切れています。storageState を取り直してください`);
-      } else this.loginHits = 0;
-    }
+    this.checkLogin(item, snap);
     this.record(N, item, this.classify(N, K, item));
-    if (K !== N) {
-      this.edges.push({ from: N, to: K, action: item.action });
+    if (item.fam) this.famOutcome.set(item.fam, K === N ? 'local' : 'other');
+    if (K === N) {
+      // 画面が変わらない操作（再表示だけ、または吸収済みのその場の変化）。地図には描かず、画面の中の操作として残す
+      this.noteLocal(node, item, s.signature !== node.signature);
+      if (item.ckey) this.localCompounds.add(item.ckey);
+    } else {
+      this.edges.push(this.edgeOf(N, K, item));
       const to = this.byId.get(K)!;
-      this.say(`   ${isNew ? '＋' : '→'} ${describeAction(item.action)} → [${K}] ${to.title || to.url}`);
+      this.say(`   ${isNew ? '＋' : '→'} ${this.describe(item)} → [${K}] ${to.title || to.url}`);
     }
     if (isNew && this.nodes.length >= this.config.maxStates) this.halt('maxStates', `画面数上限 ${this.config.maxStates} に到達`);
   }
@@ -787,6 +1166,12 @@ class Explorer {
       this.log(`── 深さ ${depth}: ${level.length} 画面・試行 ${tries} 件${held ? `（共通の操作 ${held} 件は結果を見て決める）` : ''}・これまでに ${this.nodes.length} 画面`);
       await this.runTasks(tasks);
       if (!this.stop && deferred.size) await this.runTasks(this.resolveDeferred(level, deferred));
+      // その場の変化で現れた操作を続けて押す。続けて押した結果がまたその場の変化なら、MAX_VIA 段まで繰り返す
+      for (let round = 0; round < MAX_VIA && !this.stop; round++) {
+        const more = this.planCompounds(level);
+        if (!more.length) break;
+        await this.runTasks(more);
+      }
       this.finishLevel(level);
       this.writeCheckpoint();
       level = this.nextLevel.filter((id) => this.byId.has(id));
@@ -822,9 +1207,13 @@ class Explorer {
     for (const id of level) {
       const n = this.byId.get(id);
       const cut = this.cut.get(id) ?? 0;
-      if (!n || cut <= 0 || n.truncated) continue;
+      const revealedCut = this.compoundCut.get(id) ?? 0;
+      if (!n || (cut <= 0 && revealedCut <= 0) || n.truncated) continue;
       const planned = n.actionsPlanned ?? n.actionsTotal;
-      n.truncated = `操作数上限（${planned} 件中 ${planned - cut} 件を試行・推定し、${cut} 件は試していない）`;
+      const parts: string[] = [];
+      if (cut > 0) parts.push(`${planned} 件中 ${planned - cut} 件を試行・推定し、${cut} 件は試していない`);
+      if (revealedCut > 0) parts.push(`この画面の中の変化で現れた操作 ${revealedCut} 件は試していない`);
+      n.truncated = `操作数上限（${parts.join('。')}）`;
     }
   }
 
@@ -845,11 +1234,14 @@ class Explorer {
       if (c.mergedUrls) c.mergedUrls = c.mergedUrls.map(mu);
       if (c.samples) c.samples = c.samples.map((x) => ({ ...x, url: mu(x.url) }));
       if (c.jevMerged) c.jevMerged = c.jevMerged.map((x) => ({ ...x, url: mu(x.url) }));
+      if (c.externalLinks) c.externalLinks = c.externalLinks.map((x) => ({ ...x, href: mu(x.href) }));
+      for (const l of c.localActions ?? []) if (l.action.href) l.action.href = mu(l.action.href);
       return c;
     });
+    const maskAction = (a: ActionDesc): ActionDesc => (a.href ? { ...a, href: mu(a.href) } : { ...a });
     const edges: Edge[] = this.edges.map((e) => {
-      const c: Edge = { ...e, action: { ...e.action } };
-      if (c.action.href) c.action.href = mu(c.action.href);
+      const c: Edge = { ...e, action: maskAction(e.action) };
+      if (c.via) c.via = c.via.map(maskAction);
       if (c.error) c.error = mt(c.error);
       return c;
     });
@@ -867,6 +1259,7 @@ class Explorer {
         totalEdges: edges.length,
         ...(stop ? { stoppedBecause: mt(stop.reason), stopKind: stop.kind } : {}),
         learnedPathRules: this.learned.length ? [...this.learned] : undefined,
+        learnedQueryVariants: this.learnedQueryVariants.length ? [...this.learnedQueryVariants] : undefined,
         stats: { ...this.stats },
         config: configSummary(this.config),
         jev: this.jevSummary,
@@ -985,6 +1378,7 @@ export async function explore({ config, log = console.log, signal, quiet = false
   const st = ex.stats;
   const secs = Math.round(st.durationMs / 1000);
   log(`試行 ${st.attempts} / 起点からの再現 ${st.replays} / 「戻る」で復帰 ${st.backReturns} / 推定した辺 ${st.inferredEdges} / 省いた共通操作 ${st.skippedCommon}${st.replayDrift ? ` / 再現の不一致 ${st.replayDrift}` : ''}`);
+  if (st.localChanges) log(`この画面の中の変化 ${st.localChanges}（現れた操作を続けて試行 ${st.revealedTried ?? 0}・同じ形の行で省いた操作 ${st.skippedRepeats ?? 0}・部品を除いて合流 ${st.variantJoins ?? 0}）`);
   if (judge) {
     const j = graph.meta.jev!;
     log(`Jev: 問い合わせ ${j.requests} 回（キャッシュ ${j.cacheHits} 回）/ 押さなかった操作 ${j.skippedActions} / 合流 ${j.mergedStates} / 見送ったデータ区間 ${j.rejectedPathRules.length}${j.errors ? ` / 失敗 ${j.errors} 回（${j.lastError}）` : ''}`);

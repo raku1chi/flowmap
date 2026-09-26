@@ -2,6 +2,8 @@
 //  - ヘッダの「表示順」は localStorage に保存され、summary に今の値が出る（起点を開き直しても残る）
 //  - ヘッダの検索欄は入力すると候補が開く（押していないフォームまで埋めると画面が変わる）
 //  - 商品一覧はページ送り（?page=）と、業種ならぬカテゴリ（/categories/<名前>）の一覧を持つ
+//  - 一覧の各行に「〇〇を比較に追加」（aria-label に商品名）。押すとその場で比較トレイが開き、sessionStorage に残って
+//    他の画面にも出る。トレイの「比較ページで開く」から比較ページへ進める（実アプリの「〇〇を並べて比べる」と同じ仕掛け）
 const app = document.getElementById('app');
 const modalRoot = document.getElementById('modal-root');
 const EXTERNAL_URL = document.querySelector('meta[name="demo-external"]')?.content || 'https://example.com/';
@@ -14,6 +16,7 @@ const routes = [
   { re: /^\/items\/(\d+)\/print$/, view: itemPrint },
   { re: /^\/categories\/([^/]+)$/, view: category },
   { re: /^\/search$/, view: search },
+  { re: /^\/compare$/, view: compare },
   { re: /^\/contact$/, view: contact },
   { re: /^\/thanks$/, view: thanks },
   { re: /^\/settings$/, view: settings },
@@ -50,10 +53,31 @@ function sortItems(list) {
   return list;
 }
 
+// ---- 比較トレイ（sessionStorage に保存。どの画面にも出る） ----
+const COMPARE_MAX = 3;
+const getCompare = () => { try { return JSON.parse(sessionStorage.getItem('demo.compare') || '[]'); } catch { return []; } };
+const setCompare = (list) => { sessionStorage.setItem('demo.compare', JSON.stringify(list)); render({ keepPref: true }); };
+function drawTray() {
+  const tray = document.getElementById('tray');
+  const list = getCompare();
+  tray.hidden = !list.length;
+  tray.innerHTML = list.length ? `
+    <h2>比較する商品（${list.length}）</h2>
+    <ul>${list.map((c) => `<li>${esc(c.name)} <a href="/items/${c.id}" data-link>詳しく見る</a> <button type="button" class="ghost" data-remove="${c.id}" aria-label="${esc(c.name)}を外す">外す</button></li>`).join('')}</ul>
+    <div class="row"><a class="btn" href="/compare" data-link>比較ページで開く</a><button type="button" class="ghost" id="compare-clear">すべて外す</button></div>` : '';
+}
+const compareButton = (i) => {
+  const at = getCompare().findIndex((c) => c.id === i.id);
+  return at >= 0
+    ? `<button type="button" class="ghost" data-compare="${i.id}">✓ ${at + 1} 件目</button>`
+    : `<button type="button" class="ghost" data-compare="${i.id}" data-name="${esc(i.name)}" aria-label="${esc(i.name)}を比較に追加">比較に追加</button>`;
+};
+
 async function render(opts = {}) {
   modalRoot.innerHTML = '';
   if (!opts.keepPref) document.getElementById('pref').open = false;
   drawPref();
+  drawTray();
   hideSuggest();
   const path = location.pathname;
   document.querySelectorAll('.top nav a').forEach((a) => a.classList.toggle('active', path.startsWith(a.getAttribute('href'))));
@@ -102,8 +126,8 @@ const itemTable = (list) => `
     <thead><tr><th>ID</th><th>商品名</th><th>価格</th><th>在庫</th><th></th></tr></thead>
     <tbody>${list.map((i) => `
       <tr>
-        <td>${i.id}</td><td>${esc(i.name)}</td><td>¥${i.price.toLocaleString()}</td><td>${i.stock}</td>
-        <td><a href="/items/${i.id}" data-link>詳細</a></td>
+        <td>${i.id}</td><td><a href="/items/${i.id}" data-link>${esc(i.name)}</a></td><td>¥${i.price.toLocaleString()}</td><td>${i.stock}</td>
+        <td><a href="/items/${i.id}" data-link>詳細</a> ${compareButton(i)}</td>
       </tr>`).join('')}
     </tbody>
   </table>`;
@@ -152,6 +176,7 @@ async function itemDetail([, id]) {
       <div class="row">
         <a class="btn ghost" href="/items" data-link>一覧へ戻る</a>
         <a class="btn ghost" href="/items/${item.id}/print" target="_blank">印刷用ページを開く</a>
+        <button type="button" class="ghost" data-compare-add="${item.id}" data-name="${esc(item.name)}">この商品を比較に追加</button>
         <button id="delete" class="danger">この商品を削除</button>
       </div>
     </div>`;
@@ -177,6 +202,25 @@ async function search() {
   app.innerHTML = `
     <h1>「${esc(q)}」の検索結果</h1>
     ${list.length ? itemTable(list) : '<div class="card"><p class="muted">該当する商品はありません。</p></div>'}`;
+}
+
+async function compare() {
+  document.title = '商品の比較 - Inventory Demo';
+  const list = getCompare();
+  if (!list.length) {
+    app.innerHTML = `<h1>商品の比較</h1><div class="card"><p class="muted">比較する商品がありません。一覧の「比較に追加」で選んでください。</p><a class="btn" href="/items" data-link>商品一覧へ</a></div>`;
+    return;
+  }
+  const res = await fetch('/api/items');
+  const all = res.ok ? await res.json() : [];
+  const rows = list.map((c) => all.find((i) => i.id === c.id) ?? { ...c, category: '-', price: 0, stock: 0 });
+  app.innerHTML = `
+    <h1>商品の比較</h1>
+    <table>
+      <thead><tr><th>商品名</th><th>カテゴリ</th><th>価格</th><th>在庫</th></tr></thead>
+      <tbody>${rows.map((i) => `<tr><td><a href="/items/${i.id}" data-link>${esc(i.name)}</a></td><td>${esc(i.category)}</td><td>¥${i.price.toLocaleString()}</td><td>${i.stock}</td></tr>`).join('')}</tbody>
+    </table>
+    <p><a href="/items" data-link>一覧に戻る</a></p>`;
 }
 
 function contact() {
@@ -299,6 +343,22 @@ document.addEventListener('click', (e) => {
   if (!a) return;
   e.preventDefault();
   navigate(a.getAttribute('href'));
+});
+document.addEventListener('click', (e) => {
+  const toggle = e.target.closest('[data-compare]');
+  const add = e.target.closest('[data-compare-add]');
+  const remove = e.target.closest('[data-remove]');
+  const list = getCompare();
+  if (toggle || add) {
+    const el = toggle || add;
+    const id = Number(toggle ? el.dataset.compare : el.dataset.compareAdd);
+    if (list.some((c) => c.id === id)) { if (toggle) setCompare(list.filter((c) => c.id !== id)); return; }
+    if (list.length < COMPARE_MAX) setCompare([...list, { id, name: el.dataset.name }]);
+  } else if (remove) {
+    setCompare(list.filter((c) => c.id !== Number(remove.dataset.remove)));
+  } else if (e.target.closest('#compare-clear')) {
+    setCompare([]);
+  }
 });
 document.getElementById('logout').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' });

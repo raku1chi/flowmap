@@ -40,3 +40,10 @@ input, select, textarea { font: inherit; width:100%; padding:8px 10px; border:1p
 label.check { display: flex; gap: 8px; align-items: center; }
 label.check input { width: auto; }
 .foot { max-width: 880px; margin: 0 auto; padding: 12px 24px 32px; color: var(--muted); font-size: 12px; }
+.tray { max-width: 880px; margin: 0 auto 12px; padding: 12px 24px; background: #fff; border: 1px solid var(--accent); border-radius: 8px; box-sizing: border-box; }
+.tray[hidden] { display: none; }
+.tray h2 { margin: 0 0 6px; font-size: 15px; }
+.tray ul { margin: 0 0 8px; padding-left: 18px; }
+.tray li { margin: 2px 0; }
+.tray button { padding: 3px 10px; font-size: 13px; }
+td button { padding: 3px 10px; font-size: 13px; }

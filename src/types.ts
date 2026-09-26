@@ -40,8 +40,13 @@ export interface FlowmapConfig {
   navigationTimeoutMs: number;
   /** リンクで遷移した後、ストレージが変わっていなければ「戻る」で元の画面に戻り、起点からの再現を省く（一致を確かめたときだけ） */
   useBackNavigation: boolean;
-  /** 別オリジンへのリンクを押して撮影するか */
+  /** 別オリジンへのリンクを押して撮影するか。既定 false（外部サイトは撮らず、画面ごとにリンクの一覧だけ残す） */
   followExternalLinks: boolean;
+  /**
+   * 画面の中で完結する変化（比較パネルへの追加・開閉を開く・並べ替えなど）を別の画面にせず、元の画面に吸収する。
+   * 変化で現れた操作（「比較ページで開く」など）は、元の画面からの続けての操作として探索する。既定 true（DESIGN.md §4）
+   */
+  absorbLocalChanges: boolean;
   viewport: { width: number; height: number };
   fullPageScreenshots: boolean;
   locale: string;
@@ -120,9 +125,9 @@ export interface JevConfig {
 // ---------- graph.json（§9） ----------
 
 /** graph.json の形の版。項目を足したり意味を変えたりしたら上げる */
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 /** シグネチャの計算方法の版。変えると前回との比較で「消失＋追加」が出るので、差分に注意書きを付ける */
-export const SIGNATURE_VERSION = 2;
+export const SIGNATURE_VERSION = 3;
 
 export interface ActionDesc {
   label: string;
@@ -180,7 +185,34 @@ export interface StateNode {
   jevMerged?: { url: string; score: number }[];
   /** Jev がサーバーのデータを変えると判定して押さなかった操作 */
   jevSkipped?: { role: string; label: string; score: number }[];
+  /**
+   * この画面の中で完結する操作（押しても別の画面にならない操作）。同じ形の操作は 1 件にまとめる（DESIGN.md §4・§8）。
+   * 地図には描かず、ビューアの右パネルに一覧する
+   */
+  localActions?: LocalAction[];
+  /** 押さなかった別オリジンへのリンク（followExternalLinks が false のとき。最大 30 件） */
+  externalLinks?: { label: string; href: string }[];
   truncated?: string;
+}
+
+/** 画面の中で完結する操作の記録（同じ形の操作をまとめたもの） */
+export interface LocalAction {
+  /** 同じ形の操作を束ねるキー（`button|*を並べて比べる` など） */
+  key: string;
+  /** 代表の操作（最初に押したもの） */
+  action: ActionDesc;
+  /** 行ごとの同種の操作を畳んだ形（`*を並べて比べる`）。ラベルにデータを含む操作だけ */
+  pattern?: string;
+  /** この画面にある同じ形の操作の数 */
+  count: number;
+  /** 押した数（残りは 1 件目の結果から同じと判断して押していない） */
+  tried: number;
+  /** 画面の骨格が変わったか。false なら押しても再表示だけ（ページ送り・変化のないボタン） */
+  changed: boolean;
+  /** 変化で新しく現れた操作のラベル（最大 8 件）。これらは続けて押して探索する */
+  revealed?: string[];
+  /** 変化のあとのスクリーンショット（形ごとに 1 枚） */
+  screenshot?: string;
 }
 
 export interface Edge {
@@ -190,6 +222,11 @@ export interface Edge {
   error?: string;
   /** 押さずに、他の画面での結果から推定した辺（共通のナビゲーション） */
   inferred?: true;
+  /**
+   * 先に押した、その場の変化を起こす操作（元の画面から順に）。変化で現れた操作 action を押すために通る。
+   * 「並べる → 比較ページで開く」の「並べる」
+   */
+  via?: ActionDesc[];
 }
 
 export interface RemovedNode {
@@ -226,6 +263,14 @@ export interface RunStats {
   skippedCommon: number;
   /** 経路を再現した画面が元の画面と一致しなかった回数 */
   replayDrift: number;
+  /** その場の変化として元の画面に吸収した回数 */
+  localChanges?: number;
+  /** その場の変化で現れた操作を続けて押した回数 */
+  revealedTried?: number;
+  /** 部品（比較パネルなど）が開いたままの画面を、既存の画面に合流させた回数 */
+  variantJoins?: number;
+  /** 同じ画面の同じ形の操作で、1 件目がその場の変化だったので押さなかった数 */
+  skippedRepeats?: number;
   workers: number;
   durationMs: number;
 }
@@ -245,6 +290,8 @@ export interface Graph {
     stopKind?: 'maxStates' | 'maxDuration' | 'interrupted' | 'error' | 'auth' | 'unreachable';
     /** 探索中に自動学習したデータ区間（`/companies/*` の形）。設定 pathRules に書き写せば次回から明示的になる */
     learnedPathRules?: string[];
+    /** 探索中に学習した「クエリで絞り込む一覧」のルート。h1 をデータとみなして絞り込み違いを合流させた */
+    learnedQueryVariants?: string[];
     stats?: RunStats;
     /** 比較の前提になる設定（探索の範囲と画面の同定に効くものだけ。認証情報は含めない） */
     config?: Record<string, unknown>;

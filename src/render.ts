@@ -98,6 +98,7 @@ ${CSS}
     <li><b>戻る</b> — 上のパンくず（グループ図 › グループ › フロー）を押すか、Esc で 1 段階戻ります。</li>
   </ol>
   <p class="muted">全画面を 1 枚にした木は「全画面の木」ボタンから開けます（索引用）。ヘッダのリンクのようにどこからでも行ける操作は「共通ナビ」として図から外し、右パネルに一覧しています。</p>
+  <p class="muted">画面の中で完結する操作（開閉・比較パネルへの追加・並べ替えなど）は図に描かず、右パネルの「この画面の中の操作」にまとめています（◇ の数）。そこで現れた操作から別の画面へ行ける場合は「[〇〇を並べて比べる] → 比較ページで開く」のように 1 本の線で描きます。外部サイトは撮影せず、リンクの一覧だけを右パネルに出します。</p>
   <button id="help-close" class="tbtn">閉じる</button>
 </div></div>
 <script id="graph-data" type="application/json">${data}</script>
@@ -206,7 +207,7 @@ button, input { font: inherit; }
 .item.chapter .thumb { margin-bottom: 6px; }
 .badges { position: absolute; top: -9px; left: 8px; display: flex; gap: 4px; }
 .badge { font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 999px; color: #0b1020; background: #cbd5e1; white-space: nowrap; }
-.badge.root { background: var(--blue); color: #fff; } .badge.added { background: var(--amber); } .badge.changed { background: var(--green); } .badge.err { background: var(--red); color: #fff; } .badge.trunc { background: #475569; color: #fff; }
+.badge.root { background: var(--blue); color: #fff; } .badge.added { background: var(--amber); } .badge.changed { background: var(--green); } .badge.err { background: var(--red); color: #fff; } .badge.trunc { background: #475569; color: #fff; } .badge.local { background: #334155; color: #cbd5e1; }
 .col-head { position: absolute; top: 12px; color: var(--muted); font-size: 11px; letter-spacing: .06em; }
 .stubs { position: absolute; display: flex; gap: 4px; flex-wrap: wrap; }
 .stub { font-size: 11px; color: var(--muted); border: 1px dashed var(--line); border-radius: 999px; padding: 0 8px; background: var(--bg); cursor: pointer; white-space: nowrap; }
@@ -271,6 +272,12 @@ button, input { font: inherit; }
 #panel li .to { color: var(--muted); }
 #panel li .cnt { color: var(--muted); font-size: 11px; margin-left: 4px; }
 #panel li.err { color: #fca5a5; }
+#panel .locals .lhead { display: flex; gap: 10px; align-items: flex-start; }
+#panel .locals .lthumb { width: 104px; aspect-ratio: 16/10; object-fit: cover; object-position: top; border-radius: 4px; background: #fff; cursor: zoom-in; flex: none; }
+#panel .locals .lname { font-weight: 600; }
+#panel .locals .muted { font-size: 12px; }
+#panel .ext a { color: var(--fg); }
+#panel .ext a:hover { color: #bfdbfe; }
 #panel .pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; white-space: pre-wrap; word-break: break-all; color: #fca5a5; }
 #panel .kv { display: grid; grid-template-columns: auto 1fr; gap: 2px 12px; }
 #panel .kv dt { color: var(--muted); } #panel .kv dd { margin: 0; }
@@ -482,14 +489,23 @@ const labelOfEdge = (() => {
 
 // ---- 辺のまとめ: 同じ (from, to, ラベル) は 1 本にして本数を添える。失敗した辺はまとめない ----
 // ラベルは表示用（データの値を〇〇にしたもの）で比べるので、企業名のリンク 3 本は「〇〇 ×3」の 1 本になる
+// その場の変化を経る辺（「[〇〇を比較に追加] → 比較ページで開く」）の途中の操作。行ごとの同種の操作は〇〇にした形で出す
+const localName = l => l.pattern ? l.pattern.split('*').join(PH) : (l.action.label || l.action.href || '');
+const viaActs = e => (e.via || []).map(a => {
+  const from = byId.get(e.from);
+  const hit = ((from && from.localActions) || []).find(l => l.action.role === a.role && l.action.label === a.label);
+  return hit && hit.pattern ? Object.assign({}, a, { label: localName(hit) }) : a;
+});
 const E = [];
 {
   const groups = new Map();
   G.edges.forEach((e, i) => {
     const label = labelOfEdge(e); const act = label === e.action.label ? e.action : Object.assign({}, e.action, { label });
-    const key = e.error ? 'err#' + i : e.from + '|' + e.to + '|' + fullBase(act);
+    const via = viaActs(e);
+    const viaFull = via.map(a => fullBase(a) + ' → ').join(''), viaShort = via.map(a => shortBase(a) + ' → ').join('');
+    const key = e.error ? 'err#' + i : e.from + '|' + e.to + '|' + viaFull + fullBase(act);
     let d = groups.get(key);
-    if (!d) { d = { from: e.from, to: e.to, act, dataLabel: act !== e.action, full: e.error ? fullLabel(act) : fullBase(act), short: e.error ? shortBase(act) + (act.nth > 1 ? '(' + act.nth + ')' : '') : shortBase(act), error: e.error, raw: [], nav: false, discovery: false }; groups.set(key, d); E.push(d); }
+    if (!d) { d = { from: e.from, to: e.to, act, via, dataLabel: act !== e.action, full: viaFull + (e.error ? fullLabel(act) : fullBase(act)), short: viaShort + (e.error ? shortBase(act) + (act.nth > 1 ? '(' + act.nth + ')' : '') : shortBase(act)), error: e.error, raw: [], nav: false, discovery: false }; groups.set(key, d); E.push(d); }
     d.raw.push(e);
   });
   // 押さずに推定した辺（他の画面で行き先を確かめた共通の操作）だけでできた辺
@@ -545,17 +561,21 @@ const subtitleOf = (() => {
 })();
 const nameOf = n => baseName(n) + (subtitleOf(n) ? ' · ' + subtitleOf(n) : '');
 const pathTo = id => { const chain = []; let cur = id; while (parentOf.has(cur)) { chain.unshift(treeEdgeTo.get(cur)); cur = parentOf.get(cur); } return chain; };
+// 経路のクリック数。その場の変化を経る操作（途中の操作）も 1 回ずつ数える
+const clicksOf = steps => steps.reduce((k, d) => k + 1 + (d.via ? d.via.length : 0), 0);
 const subtreeOf = id => { const out = [id]; for (const c of children.get(id) || []) out.push(...subtreeOf(c)); return out; };
 
 // ---- 操作フロー: 木の葉ごとに「起点からそこまでの経路」を 1 本のシナリオとみなす ----
 const verb = d => {
   const a = d.act || d.raw[0].action; const t = a.label || a.href || ''; const n = d.raw.length > 1 ? '（同じ操作が ' + d.raw.length + ' 件）' : '';
-  if (/(く|す|る|む|ぶ|ぐ|つ|う)$/.test(t) && /(を|に|へ|で)/.test(t)) return '「' + t + '」' + n;
-  if (a.role === 'link') return '「' + t + '」を開く' + n;
-  if (a.role === 'button') return '「' + t + '」を押す' + n;
-  if (a.role === 'tab') return '「' + t + '」タブに切り替える' + n;
-  if (a.role === 'summary') return '「' + t + '」を開く' + n;
-  return '「' + t + '」を操作する' + n;
+  // その場の変化を経る操作は、途中の操作を前に付ける: 「〇〇を比較に追加」→「比較ページで開く」を開く
+  const pre = (d.via || []).map(v => '「' + (v.label || v.href || '') + '」→ ').join('');
+  if (/(く|す|る|む|ぶ|ぐ|つ|う)$/.test(t) && /(を|に|へ|で)/.test(t)) return pre + '「' + t + '」' + n;
+  if (a.role === 'link') return pre + '「' + t + '」を開く' + n;
+  if (a.role === 'button') return pre + '「' + t + '」を押す' + n;
+  if (a.role === 'tab') return pre + '「' + t + '」タブに切り替える' + n;
+  if (a.role === 'summary') return pre + '「' + t + '」を開く' + n;
+  return pre + '「' + t + '」を操作する' + n;
 };
 
 // ---- 章: 起点から直接行ける画面ごとのグループ。起点と同じ URL の状態（モーダル等）は起点の章に含める ----
@@ -759,6 +779,8 @@ function nodeItem(n, p, nh, stubs) {
   if (isChanged(n.id)) badges.push('<span class="badge changed">変化</span>');
   if (errCount(n)) badges.push('<span class="badge err">エラー ' + errCount(n) + '</span>');
   if (n.truncated) badges.push('<span class="badge trunc" title="' + esc(n.truncated) + '">…</span>');
+  const locals = (n.localActions || []).filter(l => l.changed).length;
+  if (locals) badges.push('<span class="badge local" title="この画面の中で完結する操作 ' + locals + ' 件（右パネルに一覧）">◇ ' + locals + '</span>');
   const sub = subtitleOf(n); const eg = exampleOf(n);
   const html = '<div class="badges">' + badges.join('') + '</div>' +
     (compact ? '' : '<div class="thumb"><img loading="lazy" src="' + esc(shotSrc(n)) + '" alt="' + esc(baseName(n)) + '"></div>') +
@@ -1001,7 +1023,7 @@ function gotoNode(id) {
   if ((mode === 'chapter' || mode === 'map') && items.has(id)) { selected = id; applyState(); nodePanel(id); const el = nodesEl.querySelector('.item[data-id="' + id + '"]'); if (el) el.scrollIntoView({ block: 'center', inline: 'nearest', behavior: 'smooth' }); return; }
   const ch = chapterOf(id); openChapter(ch ? ch.id : G.root, id);
 }
-const flowItem = sc => '<li><button class="flow" data-flow="' + sc.id + '">' + esc(sc.name) + '</button><div class="meta"><span>' + sc.steps.length + ' 回のクリック</span><span>' + esc(['起点', ...sc.steps.map(d => d.short)].join(' → ')) + '</span>' + badgesOf(sc) + '</div></li>';
+const flowItem = sc => '<li><button class="flow" data-flow="' + sc.id + '">' + esc(sc.name) + '</button><div class="meta"><span>' + clicksOf(sc.steps) + ' 回のクリック</span><span>' + esc(['起点', ...sc.steps.map(d => d.short)].join(' → ')) + '</span>' + badgesOf(sc) + '</div></li>';
 function flowList(list) {
   const q = query.trim().toLowerCase();
   const shown = list.filter(sc => (filter === 'all' || (filter === 'added' && sc.added) || (filter === 'changed' && sc.changed) || (filter === 'error' && sc.err)) && (!q || sc.frames.some(f => matches(byId.get(f), q))));
@@ -1015,7 +1037,7 @@ function overviewPanel() {
   const errIds = G.nodes.filter(n => errCount(n) > 0).map(n => n.id); const failed = E.filter(d => d.error);
   panel.innerHTML =
     '<h2>探索の概要</h2>' +
-    '<dl class="kv"><dt>起点</dt><dd class="url">' + esc(G.meta.baseUrl) + '</dd><dt>開始</dt><dd>' + esc(G.meta.startedAt.replace('T', ' ').slice(0, 19)) + '</dd><dt>画面</dt><dd>' + G.nodes.length + '（' + (chapters.length - 1) + ' グループ）</dd><dt>操作</dt><dd>' + G.edges.length + '（失敗 ' + failed.length + '）</dd>' + (G.diff ? '<dt>比較対象</dt><dd class="url">' + esc(diff.previousRun) + (diff.warning ? '<div style="color:var(--amber);font-family:inherit">' + esc(diff.warning) + '</div>' : '') + '</dd>' : '<dt>比較</dt><dd>初回のため前回比なし</dd>') + (G.meta.stats ? '<dt>試行</dt><dd title="起点からの再現は毎回まっさらなブラウザで行い、「戻る」は一致を確かめたときだけ使います。共通のナビゲーションは他の画面で行き先を確かめたら押さずに推定します">' + G.meta.stats.attempts + ' 回（再現 ' + G.meta.stats.replays + '・「戻る」で復帰 ' + G.meta.stats.backReturns + '・推定 ' + G.meta.stats.inferredEdges + '・並列 ' + G.meta.stats.workers + '）' + (G.meta.stats.replayDrift ? '<div style="color:var(--amber)">再現の不一致 ' + G.meta.stats.replayDrift + ' 回（問題一覧を参照）</div>' : '') + '</dd>' : '') + (G.meta.learnedPathRules && G.meta.learnedPathRules.length ? '<dt>データ区間</dt><dd title="同じ形のリンクが並ぶ URL の区間。* の部分が違っても同じ画面として合流させた">' + G.meta.learnedPathRules.map(r => '<code>' + esc(r) + '</code>').join(' ') + '</dd>' : '') + (G.meta.jev ? '<dt>Jev</dt><dd>' + esc(G.meta.jev.model) + '・問い合わせ ' + G.meta.jev.requests + ' 回（キャッシュ ' + G.meta.jev.cacheHits + ' 回）・押さなかった操作 ' + G.meta.jev.skippedActions + '・合流 ' + G.meta.jev.mergedStates + (G.meta.jev.rejectedPathRules.length ? '・見送ったデータ区間 ' + G.meta.jev.rejectedPathRules.map(r => '<code>' + esc(r) + '</code>').join(' ') : '') + (G.meta.jev.errors ? '・<span style="color:var(--red)">失敗 ' + G.meta.jev.errors + ' 回（' + esc(G.meta.jev.lastError || '') + '）</span>' : '') + '</dd>' : '') + '</dl>' +
+    '<dl class="kv"><dt>起点</dt><dd class="url">' + esc(G.meta.baseUrl) + '</dd><dt>開始</dt><dd>' + esc(G.meta.startedAt.replace('T', ' ').slice(0, 19)) + '</dd><dt>画面</dt><dd>' + G.nodes.length + '（' + (chapters.length - 1) + ' グループ）</dd><dt>操作</dt><dd>' + G.edges.length + '（失敗 ' + failed.length + '）</dd>' + (G.diff ? '<dt>比較対象</dt><dd class="url">' + esc(diff.previousRun) + (diff.warning ? '<div style="color:var(--amber);font-family:inherit">' + esc(diff.warning) + '</div>' : '') + '</dd>' : '<dt>比較</dt><dd>初回のため前回比なし</dd>') + (G.meta.stats ? '<dt>試行</dt><dd title="起点からの再現は毎回まっさらなブラウザで行い、「戻る」は一致を確かめたときだけ使います。共通のナビゲーションは他の画面で行き先を確かめたら押さずに推定します">' + G.meta.stats.attempts + ' 回（再現 ' + G.meta.stats.replays + '・「戻る」で復帰 ' + G.meta.stats.backReturns + '・推定 ' + G.meta.stats.inferredEdges + (G.meta.stats.localChanges ? '・この画面の中の変化 ' + G.meta.stats.localChanges : '') + '・並列 ' + G.meta.stats.workers + '）' + (G.meta.stats.replayDrift ? '<div style="color:var(--amber)">再現の不一致 ' + G.meta.stats.replayDrift + ' 回（問題一覧を参照）</div>' : '') + '</dd>' : '') + (G.meta.learnedPathRules && G.meta.learnedPathRules.length ? '<dt>データ区間</dt><dd title="同じ形のリンクが並ぶ URL の区間。* の部分が違っても同じ画面として合流させた">' + G.meta.learnedPathRules.map(r => '<code>' + esc(r) + '</code>').join(' ') + '</dd>' : '') + (G.meta.jev ? '<dt>Jev</dt><dd>' + esc(G.meta.jev.model) + '・問い合わせ ' + G.meta.jev.requests + ' 回（キャッシュ ' + G.meta.jev.cacheHits + ' 回）・押さなかった操作 ' + G.meta.jev.skippedActions + '・合流 ' + G.meta.jev.mergedStates + (G.meta.jev.rejectedPathRules.length ? '・見送ったデータ区間 ' + G.meta.jev.rejectedPathRules.map(r => '<code>' + esc(r) + '</code>').join(' ') : '') + (G.meta.jev.errors ? '・<span style="color:var(--red)">失敗 ' + G.meta.jev.errors + ' 回（' + esc(G.meta.jev.lastError || '') + '）</span>' : '') + '</dd>' : '') + '</dl>' +
     (mode === 'home' ? '<div class="usage"><b>使い方</b><ol><li>左のカードは「グループ」＝起点から直接行ける画面のまとまり。押すと中の画面が木で開きます。</li><li>下の「操作フロー」を押すと、起点からの操作をコマ割りで辿れます。</li><li>戻るときは上のパンくずか Esc。</li></ol><div class="muted">エラーや差分をまとめて見たいときは、上の「問題一覧」を押してください。</div></div>' : '') +
     (mode === 'map' ? '<div class="usage"><b>使い方</b><ol><li>左は全画面の木。太い線が「初めてその画面に到達した経路」で、左から右へ深さ順です。画面を押すと右に詳細（拡大キャプチャはここで見ます）。</li><li>下の「操作フロー」を押すと、起点からの操作をコマ割りで辿れます。</li><li>画面が増えて読みにくくなったら、上の「グループ図」で画面のまとまりごとに見られます。</li></ol><div class="muted">エラーや差分をまとめて見たいときは「問題一覧」。サムネイルはヘッダのボタンで出せます。</div></div>' : '') +
     '<h3>操作フロー (' + scenarios.length + ' 本)</h3>' + flowList(scenarios) +
@@ -1057,14 +1079,21 @@ function nodePanel(id, opts = {}) {
     : '<img class="shot" src="' + esc(shotSrc(n)) + '" alt="' + esc(n.title) + '" data-zoom>' + (prev ? '<details><summary>前回のキャプチャを見る</summary><img class="shot" src="' + esc(shotSrc(prev)) + '" alt="前回" data-zoom style="margin-top:6px"></details>' : '');
   const flowNav = opts.flow ? '<div class="navbtns"><button id="sb-prev"' + (step === 0 ? ' disabled' : '') + '>← 前へ</button><span class="muted">コマ ' + (step + 1) + ' / ' + flow.frames.length + '</span><button id="sb-next"' + (step >= flow.frames.length - 1 ? ' disabled' : '') + '>次へ →</button></div>' : '';
   const myFlows = scenarios.filter(s => s.frames.includes(id) && (!flow || s !== flow));
+  // この画面の中で完結する操作。地図には描かない。変化するものはサムネイルと現れた操作、変化しないものは 1 行にまとめる
+  const locals = n.localActions || [];
+  const moving = locals.filter(l => l.changed), still = locals.filter(l => !l.changed);
+  const localLi = l => '<li><div class="lhead">' + (l.screenshot ? '<img class="lthumb" src="' + esc(l.screenshot) + '" alt="押したあとの画面" title="押したあとの画面（押すと拡大）" data-zoom>' : '') + '<div><span class="lname">' + esc(shortBase(Object.assign({}, l.action, { label: localName(l) }))) + '</span>' + (l.count > 1 ? ' <span class="cnt">同じ形の操作 ' + l.count + ' 件' + (l.tried < l.count ? '（' + l.tried + ' 件だけ押して確かめた）' : '') + '</span>' : '') + '<div class="muted">' + (l.revealed && l.revealed.length ? '現れた操作: ' + esc(l.revealed.join('・')) : 'この画面の中で表示が変わる') + '</div></div></div></li>';
+  const localBlock = locals.length ? '<h3 title="押しても別の画面にならない操作。画面の中で表示が変わるものと、再表示だけのもの">この画面の中の操作（図には描きません）</h3>' + (moving.length ? '<ul class="locals">' + moving.map(localLi).join('') + '</ul>' : '') + (still.length ? '<p class="hint">押しても画面の構成が変わらない操作: ' + esc(still.map(localName).join('・')) + '</p>' : '') : '';
+  const extBlock = n.externalLinks && n.externalLinks.length ? '<h3>外部リンク（撮影していません）</h3><ul class="ext">' + n.externalLinks.map(x => '<li><a href="' + esc(x.href) + '" target="_blank" rel="noopener noreferrer">' + esc(x.label || x.href) + '</a> <span class="to">' + esc(pathOf(x.href)) + '</span></li>').join('') + '</ul>' : '';
   panel.innerHTML =
     '<h2>' + esc(baseName(n)) + (subtitleOf(n) ? ' <span class="muted" style="font-weight:400">· ' + esc(subtitleOf(n)) + '</span>' : '') + '</h2>' +
     (exampleOf(n) ? '<div class="muted" style="margin:-2px 0 4px;font-size:12px" title="撮影したのはこの実例です。企業名・商品名などデータの部分を〇〇にした名前で表示しています">' + esc(exampleOf(n)) + '</div>' : '') +
     '<div class="url">' + esc(readable(n.url)) + '</div>' + (n.mergedUrls && n.mergedUrls.length ? '<details class="merged"><summary>同じ画面に合流した URL ' + n.mergedUrls.length + ' 件</summary><ul>' + n.mergedUrls.map(u => '<li><code>' + esc(pathOf(u)) + '</code></li>').join('') + '</ul></details>' : '') + (n.jevMerged && n.jevMerged.length ? '<details class="merged"><summary>Jev が同じ画面と判定して合流した URL ' + n.jevMerged.length + ' 件</summary><ul>' + n.jevMerged.map(m => '<li><code>' + esc(pathOf(m.url)) + '</code> <span class="cnt">' + m.score.toFixed(2) + '</span></li>').join('') + '</ul></details>' : '') + flowNav +
-    '<h3>起点からの経路' + (chain.length ? '（' + chain.length + ' 回のクリック）' : '') + '</h3>' + (id === G.root ? '<p class="empty">この画面が起点です</p>' : crumbs) +
+    '<h3>起点からの経路' + (chain.length ? '（' + clicksOf(chain) + ' 回のクリック）' : '') + '</h3>' + (id === G.root ? '<p class="empty">この画面が起点です</p>' : crumbs) +
     '<h3>キャプチャ' + (isChanged(id) ? '（前回から内容が変わっています）' : '') + '</h3>' + capture +
     '<dl class="kv" style="margin-top:8px"><dt>グループ</dt><dd><button class="linkbtn" data-chapter="' + chapterOf(id).id + '" title="グループの木で開く">' + esc(chapterName(chapterOf(id))) + ' ↗</button></dd><dt>深さ</dt><dd>' + n.depth + '</dd><dt>操作</dt><dd>' + n.actionsTried + ' / ' + (n.actionsPlanned ?? n.actionsTotal) + ' 件を試行' + (n.actionsPlanned != null && n.actionsPlanned < n.actionsTotal ? '（列挙 ' + n.actionsTotal + ' 件を同種で畳んだ）' : '') + (n.actionsSkippedCommon ? '（共通の開閉操作 ' + n.actionsSkippedCommon + ' 件は他の画面で試したため省略）' : '') + (n.actionsInferred ? '（共通のナビゲーション ' + n.actionsInferred + ' 件は他の画面の結果から推定）' : '') + '</dd>' + (n.dialog ? '<dt>ダイアログ</dt><dd>' + esc(n.dialog) + '</dd>' : '') + (n.expanded && n.expanded.length ? '<dt>開いている</dt><dd>' + esc(n.expanded.join(' / ')) + '</dd>' : '') + (n.unstable ? '<dt>再現</dt><dd style="color:var(--amber)">起点から再現すると骨格の違う画面になることがあります（' + n.unstable.count + ' 回）</dd>' : '') + (n.route ? '<dt>ルート</dt><dd><code>' + esc(n.route) + '</code></dd>' : '') + (Array.isArray(n.headings) && n.headings.length ? '<dt>見出し</dt><dd>' + esc(n.headings.join(' / ')) + '</dd>' : '') + '<dt>シグネチャ</dt><dd><code>' + n.signature + '</code></dd>' + (n.truncated ? '<dt>打ち切り</dt><dd>' + esc(n.truncated) + '</dd>' : '') + '</dl>' +
     '<h3>この画面でできる操作</h3>' + list(outs.map(d => li(d, 'out')), n.truncated ? '（' + esc(n.truncated) + 'のため列挙していません）' : '画面が変わる操作はありませんでした') + navBlock(outsNav.map(d => li(d, 'out')), '') +
+    localBlock + extBlock +
     (n.jevSkipped && n.jevSkipped.length ? '<h3 style="text-transform:none">Jev が危険と判定して押さなかった操作 (' + n.jevSkipped.length + ')</h3>' + list(n.jevSkipped.map(k => '<li>' + esc(k.label) + ' <span class="cnt">' + k.score.toFixed(2) + '</span></li>'), '') : '') +
     '<h3>ここへ来る操作</h3>' + list(ins.map(d => li(d, 'in')), n.id === G.root ? '起点' : 'なし') + navBlock(insNav.map(d => li(d, 'in')), '（他の画面から）') +
     (myFlows.length ? '<h3>この画面を通る操作フロー (' + myFlows.length + ')</h3><ul class="flows">' + myFlows.map(flowItem).join('') + '</ul>' : '') +

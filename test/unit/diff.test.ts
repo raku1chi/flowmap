@@ -55,6 +55,15 @@ test('computeDiff: シグネチャの版・Jev・中断が違えば注意書き�
   assert.equal(e.unreliable, undefined);
 });
 
+test('computeDiff: 外部サイトは消失に数えず、その場の変化の扱いが違えば信頼できない印を付ける', () => {
+  const prev = graph([node('s001', 'A', { route: '/' }), node('s002', 'E', { url: 'https://ext.example/', screenshot: '' })], { schemaVersion: 2, config: { absorbLocalChanges: false } });
+  const cur = graph([node('s001', 'A', { route: '/' })], { schemaVersion: 3, config: { absorbLocalChanges: true } });
+  const d = computeDiff(cur, '/runs/cur', { dir: '/runs/prev', name: 'prev', graph: prev });
+  assert.deepEqual(d.removed, []);
+  assert.ok(d.unreliable);
+  assert.match(d.warning!, /その場の変化/);
+});
+
 test('findBaseline: 直前の実行のうち、途中で止まっていないものを選ぶ', () => {
   const runs = mkdtempSync(join(tmpdir(), 'flowmap-runs-'));
   const write = (name: string, g: Graph) => { mkdirSync(join(runs, name)); writeFileSync(join(runs, name, 'graph.json'), JSON.stringify(g)); };

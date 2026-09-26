@@ -1,5 +1,8 @@
 // デモアプリを実際に探索して、探索エンジンの約束を確かめる。
 //   - 同じ画面を重複して撮らない（表示設定が localStorage に残っても、検索欄に候補が開いても）
+//   - 画面の中で完結する変化（開閉・比較トレイ）は別の画面にせず、現れた操作は続けて押して探索する
+//   - 比較トレイが開いたまま他の画面に移っても、既存の画面に合流する
+//   - 外部サイトは撮らず、リンクの一覧だけ残す
 //   - 並列数によらず結果（ノード id・シグネチャ・辺）が同じ
 //   - 押してはいけない操作（ログアウト・削除・退会）を押さない
 //   - 前回との差分とゲートが働く（壊れた API で新エラーと消失が出る）
@@ -55,7 +58,7 @@ test('同じ画面を重複して撮らない（見えている状態が同じ�
     seen.set(k, n.id);
   }
   assert.equal(g.edges.filter((e) => e.error).length, 0, JSON.stringify(g.edges.filter((e) => e.error), null, 1));
-  assert.ok(g.nodes.length >= 15 && g.nodes.length <= 22, `画面数 ${g.nodes.length}`);
+  assert.ok(g.nodes.length >= 14 && g.nodes.length <= 20, `画面数 ${g.nodes.length}`);
 });
 
 test('データの画面は 1 つに合流し、データ区間を学習する', () => {
@@ -65,18 +68,19 @@ test('データの画面は 1 つに合流し、データ区間を学習する',
   assert.equal(routesOf(g, '/items').length, 1, '商品一覧（ページ送り・表示順の違いを含む）');
   assert.equal(routesOf(g, '/search').length, 1, '検索結果');
   assert.ok(g.meta.learnedPathRules?.includes('/categories/*'));
+  assert.ok(g.meta.learnedQueryVariants?.includes('/items'), 'ページ送りのクエリ違いを学習する');
   const detail = routesOf(g, '/items/*')[0];
   assert.ok((detail.samples?.length ?? 0) >= 1, '別の商品の実例を残す');
 });
 
-test('モーダル・タブ・開閉は別の状態として撮り、別タブのリンクと外部サイトも辿る', () => {
+test('モーダルとタブは別の画面にし、別タブのリンクも辿る。外部サイトは撮らずにリンクだけ残す', () => {
   const g = first.graph;
   assert.ok(g.nodes.some((n) => n.dialog === 'ヘルプ'));
   assert.ok(g.nodes.some((n) => n.dialog === '保存しました'));
-  assert.ok(g.nodes.some((n) => n.route === '/' && n.expanded?.includes('表示順: 標準')));
   assert.equal(routesOf(g, '/settings').filter((n) => !n.dialog).length, 3, '設定の 3 つのタブ');
   assert.equal(routesOf(g, '/items/*/print').length, 1, 'target=_blank の印刷用ページ');
-  assert.ok(g.nodes.some((n) => n.truncated === '外部サイト' && n.url.startsWith('http://127.0.0.1')));
+  assert.ok(!g.nodes.some((n) => n.truncated === '外部サイト'), '外部サイトは撮らない');
+  assert.ok(g.nodes.find((n) => n.id === g.root)!.externalLinks?.some((l) => l.href.startsWith('http://127.0.0.1')));
   assert.ok(g.nodes.some((n) => n.route === '/thanks'), 'フォームを自動入力して送信できる');
   const about = routesOf(g, '/about')[0];
   assert.ok(about.consoleErrors.some((e) => e.includes('想定外のエラー')), '画面が変わらない操作のエラーもその画面に残す');
@@ -84,11 +88,37 @@ test('モーダル・タブ・開閉は別の状態として撮り、別タブ�
   assert.ok(report.failedRequests.some((e) => e.startsWith('500 GET')));
 });
 
+test('開閉と比較トレイは画面の中の操作として記録し、現れた操作を続けて押して比較ページに着く', () => {
+  const g = first.graph;
+  assert.ok(!g.nodes.some((n) => n.expanded?.length), '開閉を開いた状態を別の画面にしない');
+  const root = g.nodes.find((n) => n.id === g.root)!;
+  const pref = root.localActions?.find((l) => l.action.toggle);
+  assert.ok(pref?.changed && pref.revealed?.includes('在庫あり優先'), JSON.stringify(root.localActions));
+  const items = routesOf(g, '/items')[0];
+  const add = items.localActions?.find((l) => l.pattern === '*を比較に追加');
+  assert.ok(add, JSON.stringify(items.localActions));
+  assert.ok(add.count >= 2 && add.tried === 1, '一覧の各行の同じボタンは 1 件だけ押す');
+  assert.ok(add.revealed?.includes('比較ページで開く'));
+  assert.ok(add.screenshot, '変化のあとの画面を 1 枚だけ撮る');
+  const compare = routesOf(g, '/compare');
+  assert.ok(compare.length >= 1 && compare.length <= 2, `比較ページ ${compare.length}（商品ありと空）`);
+  const via = g.edges.find((e) => e.to === compare[0].id && e.via?.length);
+  assert.ok(via && /を比較に追加$/.test(via.via![0].label) && via.action.label === '比較ページで開く', '「比較に追加 → 比較ページで開く」で着く');
+});
+
+test('比較トレイが開いたまま他の画面に移っても、既存の画面に合流する', () => {
+  const g = first.graph;
+  for (const route of ['/', '/items', '/contact', '/about', '/report', '/search', '/items/*']) {
+    assert.equal(routesOf(g, route).filter((n) => !n.dialog).length, 1, route);
+  }
+  assert.ok((g.meta.stats?.variantJoins ?? 0) >= 1);
+});
+
 test('共通のナビゲーションは他の画面での結果から推定し、押す回数を減らす', () => {
   const g = first.graph;
   assert.ok(g.edges.some((e) => e.inferred), '推定した辺がある');
   assert.ok((g.meta.stats?.inferredEdges ?? 0) > 20);
-  assert.ok((g.meta.stats?.attempts ?? 999) < 110, `試行 ${g.meta.stats?.attempts}`);
+  assert.ok((g.meta.stats?.attempts ?? 999) < 125, `試行 ${g.meta.stats?.attempts}`);
 });
 
 test('押してはいけない操作を押さない（ログアウト・削除・退会）', async () => {
@@ -102,8 +132,8 @@ test('押してはいけない操作を押さない（ログアウト・削除�
 test('並列数によらず同じ結果になり、前回との差分は出ない', async () => {
   const second = await explore({ config: configFor(demo.url, { workers: 2 }), log: quietLog });
   const shape = (g: Graph) => ({
-    nodes: g.nodes.map((n) => [n.id, n.signature, n.depth]),
-    edges: g.edges.map((e) => [e.from, e.to, e.action.role, e.action.label, e.action.nth, !!e.inferred, !!e.error]),
+    nodes: g.nodes.map((n) => [n.id, n.signature, n.depth, (n.localActions ?? []).map((l) => [l.key, l.tried, l.changed])]),
+    edges: g.edges.map((e) => [e.from, e.to, e.action.role, e.action.label, e.action.nth, !!e.inferred, !!e.error, (e.via ?? []).map((v) => v.label)]),
   });
   assert.deepEqual(shape(second.graph), shape(first.graph));
   const d = second.graph.diff!;
@@ -137,13 +167,18 @@ test('ビューアがエラーなく開き、主な表示を切り替えられ�
     await page.waitForFunction(() => !!(window as unknown as { __flowmap?: unknown }).__flowmap);
     const count = await page.locator('#nodes .item').count();
     assert.ok(count >= 10, `描いたノード ${count}`);
-    await page.evaluate(() => {
-      const f = (window as unknown as { __flowmap: { openIssues(): void; goHome(): void; openMap(): void; scenarios: { id: string }[]; openFlow(id: string, k: number): void; chapters: { id: string }[]; openChapter(id: string): void } }).__flowmap;
+    const rootId = first.graph.root;
+    const panelText = await page.evaluate((root) => {
+      const f = (window as unknown as { __flowmap: { openIssues(): void; goHome(): void; openMap(): void; scenarios: { id: string }[]; openFlow(id: string, k: number): void; chapters: { id: string }[]; openChapter(id: string, selectId?: string): void } }).__flowmap;
       f.openIssues(); f.goHome(); f.openMap();
       if (f.scenarios.length) f.openFlow(f.scenarios[0].id, 1);
       if (f.chapters.length > 1) f.openChapter(f.chapters[1].id);
-    });
+      f.openChapter(root, root);
+      return document.getElementById('panel')!.textContent ?? '';
+    }, rootId);
     assert.deepEqual(errors, []);
+    assert.match(panelText, /この画面の中の操作/);
+    assert.match(panelText, /外部リンク（撮影していません）/);
   } finally {
     await browser.close();
   }
