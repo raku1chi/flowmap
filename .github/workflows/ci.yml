@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm typecheck
+      - run: pnpm test
+      # デモアプリを実際に探索する（重複しないこと・並列数によらず同じ結果・押してはいけない操作を押さない・差分とゲート・ビューア）
+      - run: pnpm test:browser
+
+  demo:
+    # flowmap 自身でデモを探索し、ビューアを成果物に残す（見た目の確認用）
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm exec playwright install --with-deps chromium
+      - name: デモアプリを起動
+        run: |
+          pnpm demo > demo.log 2>&1 &
+          for i in $(seq 1 50); do curl -sf http://localhost:3210/api/version > /dev/null && break; sleep 0.2; done
+      - name: 探索
+        run: pnpm explore --quiet
+      - name: 要約をジョブの概要に出す
+        if: always()
+        run: cat flowmap-out/runs/*/summary.md >> "$GITHUB_STEP_SUMMARY" || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: flowmap-demo
+          path: flowmap-out/runs/
+          retention-days: 14
