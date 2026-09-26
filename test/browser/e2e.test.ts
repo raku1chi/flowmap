@@ -179,6 +179,25 @@ test('ビューアがエラーなく開き、主な表示を切り替えられ�
     assert.deepEqual(errors, []);
     assert.match(panelText, /この画面の中の操作/);
     assert.match(panelText, /外部リンク（撮影していません）/);
+
+    // 商品名（データ）は画面名・辺のラベル・フロー名・この画面の中の操作に出さず、〇〇にする
+    const itemsId = routesOf(first.graph, '/items')[0].id;
+    const shown = await page.evaluate((items) => {
+      const f = (window as unknown as { __flowmap: { openMap(): void; openChapter(id: string, selectId?: string): void; E: { short: string; error?: string }[]; scenarios: { name: string }[] } }).__flowmap;
+      f.openMap();
+      const titles = [...document.querySelectorAll('#nodes .item .title')].map((x) => x.textContent ?? '');
+      f.openChapter(items, items);
+      const panel = document.getElementById('panel')!.textContent ?? '';
+      const local = panel.slice(panel.indexOf('この画面の中の操作'), panel.indexOf('ここへ来る操作'));
+      return { texts: [...titles, ...f.E.filter((d) => !d.error).map((d) => d.short), ...f.scenarios.map((s) => s.name)], local };
+    }, itemsId);
+    const names = ['ノートPC', 'モニター', 'キーボード', 'デスクトップPC', 'マウス', 'Web カメラ', 'ヘッドセット', 'USB ハブ', 'ケーブルセット'];
+    const leaked = shown.texts.filter((t) => names.some((n) => t.includes(n)));
+    assert.deepEqual(leaked, [], '商品名がそのまま出ている');
+    assert.ok(shown.texts.some((t) => t.includes('〇〇')));
+    assert.match(shown.local, /〇〇を比較に追加/);
+    assert.match(shown.local, /〇〇を外す/);
+    assert.ok(!names.some((n) => shown.local.includes(n)), shown.local);
   } finally {
     await browser.close();
   }

@@ -413,6 +413,15 @@ function urlDataValues(n, url) {
  * 入っていれば（「サービス業の企業一覧」）、URL の値がデータで残りはテンプレートの文言とみなす。
  * 置き換えるとサイト名しか残らないとき（商品名だけのタイトル）は、データでない見出し（「商品詳細」）を名前にする。
  */
+// データの名前の辞書（企業名・商品名など）。画面名・辺のラベル・フロー名・この画面の中の操作から〇〇にして消す。templateOf の中で作る
+let KNOWN_NAMES = [];
+/** 行ごとの同種の操作（探索が「*を比較に追加」の形に畳んだもの）のラベルから、* に当たる部分（商品名）を取り出す */
+const patternParts = (pattern, label) => {
+  try {
+    const re = new RegExp('^' + pattern.split('*').map(p => p.replace(/[.*+?^$|()[\]{}\\]/g, '\\$&').replace(/#/g, '\\d+(?:[,.]\\d+)*')).join('(.+)') + '$');
+    const m = re.exec(label); return m ? m.slice(1).map(v => v.trim()) : [];
+  } catch { return []; }
+};
 const templateOf = (() => {
   const cache = new Map();
   const compute = (n, known) => {
@@ -420,11 +429,16 @@ const templateOf = (() => {
     const inst = [{ url: n.url, title: n.title, heading: (n.headings || [])[0] || '' }, ...(n.samples || [])];
     const vals = inst.map(i => urlDataValues(n, i.url).concat(known));
     const heads = inst.map((i, k) => normText(scrubText(i.heading || '', vals[k]).text));
-    const headingIsData = inst.length >= 2 ? new Set(heads).size > 1 : (n.route.includes('*') && !!heads[0] && !heads[0].includes(PH));
+    // 実例が 1 つなら、データ区間を持つ画面の見出しをデータとみなす。ただしタイトルの中にもうデータ（URL の値・辞書の名前）が
+    // 見つかっていれば、見出し（「印刷用ページ」）はテンプレートの文言とみなす
+    const titleHasData = scrubText(inst[0].title, vals[0]).removed.length > 0;
+    const headingIsData = inst.length >= 2 ? new Set(heads).size > 1 : (n.route.includes('*') && !!heads[0] && !heads[0].includes(PH) && !titleHasData);
     const values = inst.map((i, k) => vals[k].concat(headingIsData && i.heading ? [i.heading] : []));
     const scrubbed = inst.map((i, k) => scrubText(i.title, values[k]));
     let name = scrubbed[0].text; let example = scrubbed[0].removed[0] || '';
     const texts = [...new Set(scrubbed.map(x => x.text))];
+    // 実例ごとの、タイトルの違う部分（商品名だけのタイトルの商品名）。実例の値に足して、その実例へのリンクのラベルからも消す
+    let varying = [];
     // 代表（撮影した実例）のタイトルからデータを消せたら、それを名前にする。実例ごとにタイトルの形が違うアプリ
     // （開示項目の多い企業だけ「〇〇の平均年収・…」になる）で、実例どうしの共通部分が「〇〇の〇〇」に痩せるのを避けるため
     if (texts.length > 1 && !scrubbed[0].removed.length) {
@@ -433,7 +447,8 @@ const templateOf = (() => {
       let pre = 0; while (pre < min && arr.every(a => a[pre] === arr[0][pre])) pre++;
       let suf = 0; while (suf < min - pre && arr.every(a => a[a.length - 1 - suf] === arr[0][arr[0].length - 1 - suf])) suf++;
       name = collapsePH(arr[0].slice(0, pre).join('') + PH + arr[0].slice(arr[0].length - suf).join(''));
-      if (!example) example = arr[0].slice(pre, arr[0].length - suf).join('').split(PH).join('').trim();
+      varying = scrubbed.map(x => { const a = Array.from(x.text); return a.slice(pre, Math.max(pre, a.length - suf)).join('').split(PH).join('').trim(); });
+      if (!example) example = varying[0] || '';
     }
     const core = stripSite(name).split(PH).join('').replace(/[\s\p{P}]/gu, '');
     if (!core) {
@@ -442,20 +457,46 @@ const templateOf = (() => {
     }
     if (name === n.title) return null;
     return {
-      name, example, headingIsData,
+      name, example, headingIsData, varying,
       removed: scrubbed.flatMap(x => x.removed),
       others: (n.mergedUrls || []).length + (n.jevMerged || []).length,
-      instances: inst.map((i, k) => ({ key: urlKey(i.url), values: values[k] })),
+      instances: inst.map((i, k) => ({ key: urlKey(i.url), values: varying[k] ? values[k].concat([varying[k]]) : values[k] })),
       headings: (n.headings || []).map((h, i) => (i === 0 && headingIsData ? null : scrubText(h, vals[0]).text)).filter(Boolean),
     };
   };
-  // データ区間を持つ画面で「データ」と分かった値（企業名・業種名など）の辞書。URL にデータを持つ別の画面のタイトルからも消す。
-  // 比較画面のタイトル「ＡＩＡＩグループ株式会社を比べる」は、企業名が URL（法人番号）にも見出しにも出ないため、これで拾う
-  const KNOWN = [...new Set(G.nodes.filter(n => n.route && n.route.includes('*')).flatMap(n => { const t = compute(n, []); return t ? t.removed : []; }).map(normText).filter(v => v.length >= 3 && usableValue(v)))];
-  const carriesData = n => !!n.route && (n.route.includes('*') || n.route.split('?')[1] !== undefined && n.route.split('?')[1].split('&').some(k => !k.includes('=')));
+  // データと分かった値（企業名・業種名・商品名など）の辞書。別の画面のタイトルや、辺・操作のラベルからも消す。
+  // 比較画面のタイトル「ＡＩＡＩグループ株式会社を比べる」は、企業名が URL（法人番号）にも見出しにも出ないため、これで拾う。
+  // 手がかりは 2 つ。データ区間を持つ画面で消した値と実例どうしで違うタイトルの部分、探索が行ごとの同種の操作として畳んだラベルの〇〇の部分
+  const fromScreens = G.nodes.filter(n => n.route && n.route.includes('*')).flatMap(n => { const t = compute(n, []); return t ? [...t.removed, ...t.varying] : []; });
+  const fromRows = G.nodes.flatMap(n => (n.localActions || []).flatMap(l => (l.pattern ? patternParts(l.pattern, l.action.label || '') : [])));
+  // 畳まれずに別々の辺になった行ごとのボタン（古い graph.json や absorbLocalChanges: false）: 同じ画面から出る、共通の前置きか後置き
+  // （3 文字以上）を持つ 4 つ以上のボタンのラベルの違う部分。探索の pageData と同じ規則で、リンクは対象にしない（「会社概要を見る」「採用情報を見る」はデータではない）
+  const fromFamilies = [];
+  {
+    const bySource = new Map();
+    for (const e of G.edges) {
+      const a = e.action; if (a.href || a.toggle || a.role === 'link' || !a.label) continue;
+      const k = e.from + '|' + a.role; if (!bySource.has(k)) bySource.set(k, new Set()); bySource.get(k).add(normText(a.label));
+    }
+    const affixes = l => { const a = Array.from(l); const out = []; for (let k = 3; k <= a.length - 2; k++) out.push('S' + a.slice(a.length - k).join(''), 'P' + a.slice(0, k).join('')); return out; };
+    for (const set of bySource.values()) {
+      if (set.size < 4) continue;
+      const count = new Map();
+      for (const l of set) for (const x of new Set(affixes(l))) count.set(x, (count.get(x) || 0) + 1);
+      for (const l of set) {
+        const cands = affixes(l).filter(x => count.get(x) >= 4); if (!cands.length) continue;
+        const max = Math.max(...cands.map(x => count.get(x)));
+        const best = cands.filter(x => count.get(x) >= max * 0.8).sort((x, y) => y.length - x.length || (x < y ? -1 : 1))[0];
+        const n = Array.from(best).length - 1; const a = Array.from(l);
+        fromFamilies.push((best[0] === 'S' ? a.slice(0, a.length - n) : a.slice(n)).join('').trim());
+      }
+    }
+  }
+  KNOWN_NAMES = [...new Set([...fromScreens.map(normText).filter(v => v.length >= 3), ...fromRows.map(normText), ...fromFamilies].filter(usableValue))];
+  const KNOWN = KNOWN_NAMES;
   return n => {
     if (cache.has(n.id)) return cache.get(n.id);
-    let t = compute(n, carriesData(n) ? KNOWN : []);
+    let t = compute(n, KNOWN);
     // 設定 screenNames による上書き（ルートそのもの、またはクエリを除いたルートで引く）
     const key = n.route ? [n.route, n.route.split('?')[0]].find(k => Object.prototype.hasOwnProperty.call(SCREEN_NAMES, k)) : undefined;
     if (key) t = Object.assign({ example: '', others: 0, instances: [], headingIsData: false, headings: null }, t || {}, { name: SCREEN_NAMES[key], fixed: true });
@@ -465,6 +506,13 @@ const templateOf = (() => {
 const baseName = n => { const t = templateOf(n); return t ? t.name : (n.title || '(無題)'); };
 const headsOf = n => { const t = templateOf(n); return t && t.headings ? t.headings : (n.headings || []); };
 const exampleOf = n => { const t = templateOf(n); return t && t.example ? '例: ' + t.example + (t.others ? ' ほか ' + t.others + ' 件' : '') : ''; };
+/** 表示するラベルから、データの名前（KNOWN_NAMES）を〇〇にする。残りが件数などの数字と記号だけなら全体を〇〇にする（「サービス業 668」→「〇〇」） */
+const scrubKnown = s => {
+  const r = scrubText(s, KNOWN_NAMES);
+  if (!r.removed.length) return s;
+  const rest = r.text.split(PH).join('').replace(/\d+(?:[,.]\d+)*/g, '').replace(/[\s\p{P}]/gu, '');
+  return rest ? r.text : PH;
+};
 /**
  * 辺のラベル。行き先がテンプレート名の画面で、ラベルがその実例のデータ（企業名など）なら〇〇にする。
  * 実例が記録されていない古い graph.json では、同じ画面から同じ行き先へ違うラベルのリンクが 2 本以上あればデータとみなす
@@ -472,9 +520,9 @@ const exampleOf = n => { const t = templateOf(n); return t && t.example ? '例: 
 const labelOfEdge = (() => {
   const labelsByPair = new Map();
   for (const e of G.edges) { if (e.error || e.action.role !== 'link') continue; const k = e.from + '>' + e.to; if (!labelsByPair.has(k)) labelsByPair.set(k, new Set()); labelsByPair.get(k).add(e.action.label); }
-  return e => {
+  const own = e => {
     const a = e.action; const to = byId.get(e.to);
-    if (e.error || a.role !== 'link' || !a.href || !to || !to.route) return a.label;
+    if (a.role !== 'link' || !a.href || !to || !to.route) return a.label;
     const t = templateOf(to); if (!t) return a.label;
     const found = t.instances.find(i => i.key === urlKey(a.href));
     // 実例が記録されていない古い graph.json 向けの予備。ページ番号のような数字だけのラベルは対象にしない
@@ -485,16 +533,19 @@ const labelOfEdge = (() => {
     const rest = r.text.split(PH).join('').replace(/\d+(?:[,.]\d+)*/g, '').replace(/[\s\p{P}]/gu, '');
     return rest ? r.text : PH;
   };
+  // 失敗した操作は、どの要素で失敗したかが分かるよう元のラベルのまま出す。それ以外は行き先の実例か辞書でデータを〇〇にする
+  return e => { if (e.error) return e.action.label; const l = own(e); return l === e.action.label ? scrubKnown(l) : l; };
 })();
 
 // ---- 辺のまとめ: 同じ (from, to, ラベル) は 1 本にして本数を添える。失敗した辺はまとめない ----
 // ラベルは表示用（データの値を〇〇にしたもの）で比べるので、企業名のリンク 3 本は「〇〇 ×3」の 1 本になる
 // その場の変化を経る辺（「[〇〇を比較に追加] → 比較ページで開く」）の途中の操作。行ごとの同種の操作は〇〇にした形で出す
-const localName = l => l.pattern ? l.pattern.split('*').join(PH) : (l.action.label || l.action.href || '');
+const localName = l => l.pattern ? l.pattern.split('*').join(PH) : scrubKnown(l.action.label || l.action.href || '');
 const viaActs = e => (e.via || []).map(a => {
   const from = byId.get(e.from);
   const hit = ((from && from.localActions) || []).find(l => l.action.role === a.role && l.action.label === a.label);
-  return hit && hit.pattern ? Object.assign({}, a, { label: localName(hit) }) : a;
+  const label = hit ? localName(hit) : scrubKnown(a.label || '');
+  return label === a.label ? a : Object.assign({}, a, { label });
 });
 const E = [];
 {
@@ -543,7 +594,7 @@ const navEdgeCount = E.filter(d => d.nav).length;
 // ---- 副題: 同じタイトルの画面は、他と共有していない見出しで区別する ----
 // 名前と見出しはテンプレート化したもので比べる（データの見出し＝企業名を副題にしない）
 // 同じ名前の画面を見分ける手がかり。ダイアログの名前・開いている開閉・見出しの順に使う
-const cluesOf = n => [...(n.dialog ? ['「' + n.dialog + '」を表示中'] : []), ...(n.expanded || []).map(l => '「' + l + '」を開いた状態'), ...headsOf(n)];
+const cluesOf = n => [...(n.dialog ? ['「' + scrubKnown(n.dialog) + '」を表示中'] : []), ...(n.expanded || []).map(l => '「' + scrubKnown(l) + '」を開いた状態'), ...headsOf(n)];
 const subtitleOf = (() => {
   const byTitle = new Map();
   for (const n of G.nodes) { const k = baseName(n); if (!byTitle.has(k)) byTitle.set(k, []); byTitle.get(k).push(n); }
@@ -1082,7 +1133,7 @@ function nodePanel(id, opts = {}) {
   // この画面の中で完結する操作。地図には描かない。変化するものはサムネイルと現れた操作、変化しないものは 1 行にまとめる
   const locals = n.localActions || [];
   const moving = locals.filter(l => l.changed), still = locals.filter(l => !l.changed);
-  const localLi = l => '<li><div class="lhead">' + (l.screenshot ? '<img class="lthumb" src="' + esc(l.screenshot) + '" alt="押したあとの画面" title="押したあとの画面（押すと拡大）" data-zoom>' : '') + '<div><span class="lname">' + esc(shortBase(Object.assign({}, l.action, { label: localName(l) }))) + '</span>' + (l.count > 1 ? ' <span class="cnt">同じ形の操作 ' + l.count + ' 件' + (l.tried < l.count ? '（' + l.tried + ' 件だけ押して確かめた）' : '') + '</span>' : '') + '<div class="muted">' + (l.revealed && l.revealed.length ? '現れた操作: ' + esc(l.revealed.join('・')) : 'この画面の中で表示が変わる') + '</div></div></div></li>';
+  const localLi = l => '<li><div class="lhead">' + (l.screenshot ? '<img class="lthumb" src="' + esc(l.screenshot) + '" alt="押したあとの画面" title="押したあとの画面（押すと拡大）" data-zoom>' : '') + '<div><span class="lname">' + esc(shortBase(Object.assign({}, l.action, { label: localName(l) }))) + '</span>' + (l.count > 1 ? ' <span class="cnt">同じ形の操作 ' + l.count + ' 件' + (l.tried < l.count ? '（' + l.tried + ' 件だけ押して確かめた）' : '') + '</span>' : '') + '<div class="muted">' + (l.revealed && l.revealed.length ? '現れた操作: ' + esc([...new Set(l.revealed.map(scrubKnown))].join('・')) : 'この画面の中で表示が変わる') + '</div></div></div></li>';
   const localBlock = locals.length ? '<h3 title="押しても別の画面にならない操作。画面の中で表示が変わるものと、再表示だけのもの">この画面の中の操作（図には描きません）</h3>' + (moving.length ? '<ul class="locals">' + moving.map(localLi).join('') + '</ul>' : '') + (still.length ? '<p class="hint">押しても画面の構成が変わらない操作: ' + esc(still.map(localName).join('・')) + '</p>' : '') : '';
   const extBlock = n.externalLinks && n.externalLinks.length ? '<h3>外部リンク（撮影していません）</h3><ul class="ext">' + n.externalLinks.map(x => '<li><a href="' + esc(x.href) + '" target="_blank" rel="noopener noreferrer">' + esc(x.label || x.href) + '</a> <span class="to">' + esc(pathOf(x.href)) + '</span></li>').join('') + '</ul>' : '';
   panel.innerHTML =
