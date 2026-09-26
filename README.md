@@ -92,18 +92,55 @@ pnpm render flowmap-out/runs/<ディレクトリ>
   "maxStates": 60,
   "maxDepth": 6,
   "maxActionsPerState": 25,
+  "maxActionsPerPattern": 3,
+  "maxLocalActionRepeats": 2,
   "settleMs": 600,
+  "stabilizeMs": 2000,
+  "useBackNavigation": true,
   "denyText": ["ログアウト", "削除", "退会", "logout", "sign out", "delete"],
   "denySelectors": ["[data-flowmap-ignore]"],
   "denyUrlPatterns": ["/logout", "/signout", "^mailto:", "^tel:"],
+  "pathRules": [{ "pattern": "^/users/[^/]+", "replace": "/users/*" }],
+  "queryParams": "names",
+  "structuralParams": ["tab"],
   "fill": { "email": "flowmap@example.com", "text": "flowmap テスト入力" },
   "allowSubmit": true,
-  "allowedHosts": ["localhost", "127.0.0.1"]
+  "allowedHosts": ["localhost", "127.0.0.1"],
+  "jev": { "enabled": false, "actions": true, "pages": true, "dataSegments": true }
 }
 ```
 
-アプリ固有の危険な操作（「承認」「出荷」「送金」など）は `denyText` に必ず足してください。
+アプリ固有の危険な操作（「承認」「出荷」「送金」など）は `denyText` に必ず足してください。`--jev` を使うと意味で判定して押さなくなりますが、確実に止めたい操作は `denyText` にも書いておくのが安全です。
 押してほしくない要素には `data-flowmap-ignore` 属性を付けるのが確実です。
+
+### 画面名に企業名や商品名を出したくないとき
+
+`/company/1234` のような同じテンプレートの画面は、タイトルの企業名・商品名などを「〇〇」に置き換えた名前で表示します（「〇〇の働きやすさデータ」）。撮影した実例はカードと右パネルに「例: ＡＩＡＩグループ株式会社 ほか 3 件」と添えます。自動の名前が読みにくいときは、設定で直接指定できます。表示だけの設定なので、探索し直さずに `pnpm render` で反映できます。
+
+```jsonc
+{ "screenNames": { "/company/*": "企業詳細", "/compare?cn": "企業の比較" } }
+```
+
+キーはビューアの右パネルの「ルート」に出ている形で書きます。
+
+### Jev で判定を補う（任意）
+
+`--jev` を付けると、機械的なルールでは判断しにくい 3 か所に [Jev](https://docs.typesafe.ai/introduction)（typesafe.ai の型付き判定モデル）の判定を足します。
+
+- **押さない操作を増やす。** 「出荷する」「承認する」「送金する」のように `denyText` に無い操作でも、データを変えると判定したら押しません。フォームの送信や保存も押さなくなります。
+- **同じ画面を合流させる。** 企業詳細のように、データによって項目が増減して別の画面に分かれていたものを 1 つにまとめます。メニューやタブ、ダイアログを開いた状態は別の画面のまま残ります。
+- **データ区間の学習を確かめる。** `/settings/profile` `/settings/security` のような別々の画面を、同じ形の URL だからといって合流させないようにします。
+
+```sh
+cp .env.example .env          # TYPESAFE_API_KEY を入れる（.env は git 管理外）
+pnpm explore --url http://localhost:3000 --jev
+```
+
+判定のために、画面のタイトル・見出し・操作のラベル・URL のパスを typesafe.ai に送ります。認証情報、スクリーンショット、本文は送りません。社外に出せない内容を表示するアプリでは使わないでください。答えは `flowmap-out/jev-cache.json` にキャッシュするので、同じ画面には毎回同じ判定になります。設定は `flowmap.config.json` の `jev` で変えられます（DESIGN.md の 11 章）。フォームの先の画面も地図に載せたいときは `"jev": { "enabled": true, "actions": false }` のように操作の判定だけ止めます。
+
+### 同じテンプレートの画面が増えすぎるとき
+
+`/companies/サービス業` `/companies/小売業` のように URL の一部だけ違う画面は、既定で自動的に 1 つのノードに合流します（同じ画面に同じ形のリンクが 3 本以上並んでいれば、その区間をデータとみなします）。合流した区間はビューアの概要に「データ区間」として出ます。自動で拾えない場合は `pathRules` に正規表現で宣言してください。クエリは既定で名前だけを見るので `?page=2` と `?page=3` は同じ画面です。`?tab=...` のように値で画面が変わるものは `structuralParams` に名前を挙げます。
 
 ## 出力
 

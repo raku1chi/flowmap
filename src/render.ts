@@ -2,20 +2,26 @@ import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import type { Graph } from './types.js';
 
+/** 表示だけに効く設定。graph.json には入れず、レンダラに渡す（探索をやり直さずに変えられるように） */
+export interface ViewOptions {
+  /** 画面名の上書き。キーはルート（`/company/*` や `/search?q`） */
+  screenNames?: Record<string, string>;
+}
+
 /** 実行ディレクトリの graph.json から単体で開ける index.html を生成する */
-export function render(runDir: string): string {
+export function render(runDir: string, view: ViewOptions = {}): string {
   const graphPath = join(runDir, 'graph.json');
   if (!existsSync(graphPath)) throw new Error(`graph.json が見つかりません: ${graphPath}`);
   const graph = JSON.parse(readFileSync(graphPath, 'utf8')) as Graph;
-  const html = buildHtml(graph, basename(runDir));
+  const html = buildHtml(graph, basename(runDir), view);
   const out = join(runDir, 'index.html');
   writeFileSync(out, html);
   return out;
 }
 
-export function buildHtml(graph: Graph, runName: string): string {
-  // </script> や <!-- がタイトル等に含まれても壊れないよう < をエスケープして埋め込む
-  const data = JSON.stringify(graph).replace(/</g, '\\u003c').replace(new RegExp(String.fromCharCode(0x2028), 'g'), '\\u2028').replace(new RegExp(String.fromCharCode(0x2029), 'g'), '\\u2029');
+export function buildHtml(graph: Graph, runName: string, view: ViewOptions = {}): string {
+  // </script> や <!-- がタイトル等に含まれても壊れないよう < をエスケープして埋め込む。表示用の設定は __view に添える
+  const data = JSON.stringify({ ...graph, __view: { screenNames: view.screenNames ?? {} } }).replace(/</g, '\\u003c').replace(new RegExp(String.fromCharCode(0x2028), 'g'), '\\u2028').replace(new RegExp(String.fromCharCode(0x2029), 'g'), '\\u2029');
   const host = (() => { try { return new URL(graph.meta.baseUrl).host; } catch { return graph.meta.baseUrl; } })();
   return `<!doctype html>
 <html lang="ja">
@@ -251,6 +257,10 @@ button, input { font: inherit; }
 #panel h2 { font-size: 15px; margin: 0 0 6px; }
 #panel h3 { font-size: 12px; color: var(--muted); margin: 16px 0 6px; text-transform: uppercase; letter-spacing: .06em; }
 #panel .url { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; color: var(--muted); word-break: break-all; }
+#panel details.merged { margin-top: 4px; font-size: 11px; color: var(--muted); }
+#panel details.merged summary { cursor: pointer; }
+#panel details.merged ul { margin: 4px 0 0; padding-left: 16px; max-height: 160px; overflow: auto; }
+#panel details.merged code { word-break: break-all; }
 #panel .shot { width: 100%; border-radius: 6px; background: #fff; cursor: zoom-in; display: block; }
 #panel .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
 #panel .pair .cap { font-size: 11px; color: var(--muted); margin-bottom: 3px; }
@@ -320,6 +330,10 @@ const esc = s => String(s ?? '').replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '
 const origin = (() => { try { return new URL(G.meta.baseUrl).origin; } catch { return ''; } })();
 const pathOf = u => { try { const x = new URL(u); return x.origin === origin ? x.pathname + x.search : x.host + x.pathname; } catch { return u; } };
 const routeOf = u => { try { const x = new URL(u); return (x.origin === origin ? '' : x.host) + x.pathname.replace(/\d+/g, '#'); } catch { return u; } };
+// ノードの経路名。探索側が正規化したルート（データ区間は *）があればそれを使い、古い graph.json では URL から作る
+const routeOfNode = n => (n.route ? n.route.split('?')[0] : routeOf(n.url));
+const readable = u => { try { return decodeURI(u); } catch { return u; } };
+const shownPath = n => n.route || pathOf(n.url);
 const ROLE_JA = { link: 'リンク', button: 'ボタン', tab: 'タブ', menuitem: 'メニュー', summary: '開閉' };
 const fullBase = a => '「' + (a.label || a.href) + '」' + (ROLE_JA[a.role] || a.role);
 const fullLabel = a => fullBase(a) + (a.nth > 1 ? '(' + a.nth + ')' : '');
@@ -328,14 +342,151 @@ const charW = ch => ch.charCodeAt(0) > 0xff ? 11 : 6.4;
 const textWidth = s => Array.from(s).reduce((w, ch) => w + charW(ch), 0);
 const fitText = (s, maxW) => { if (textWidth(s) <= maxW) return s; let out = ''; let w = 0; for (const ch of Array.from(s)) { if (w + charW(ch) > maxW - 8) break; out += ch; w += charW(ch); } return out + '…'; };
 
+// ---- 画面名のテンプレート化: 企業名・商品名などデータの値を〇〇に置き換える（DESIGN.md §8） ----
+// データとみなす値は 3 つ。URL のデータ区間（*）とクエリの値、データを表す見出し、実例どうしで違うタイトルの部分。
+// 画面の同一性（シグネチャ）には関わらない表示だけの処理で、graph.json から毎回作り直す
+const PH = '〇〇';
+const SCREEN_NAMES = (G.__view && G.__view.screenNames) || {};
+const normText = s => String(s == null ? '' : s).normalize('NFKC').replace(/\s+/g, ' ').trim();
+const decodePart = s => { try { return decodeURIComponent(s); } catch { return s; } };
+// 2 文字以上で、数字と記号だけではない値だけを置き換える（「2」や「#」で無関係な部分を消さないため）
+const usableValue = v => v.length >= 2 && /[^\d\s#.,:\/\-]/.test(v);
+const collapsePH = s => s.replace(/〇〇(?:[\s・、,]*〇〇)+/g, PH);
+/** text の中の values を〇〇に置き換える。比べるときは全角半角と空白を正規化し、残す部分は元の文字のままにする */
+function scrubText(text, values) {
+  const orig = String(text == null ? '' : text);
+  const vs = [...new Set(values.map(normText).filter(usableValue))].sort((a, b) => b.length - a.length);
+  if (!vs.length) return { text: orig, removed: [] };
+  let norm = ''; const at = [];
+  for (let i = 0; i < orig.length; i++) {
+    let c = orig[i].normalize('NFKC'); if (/\s/.test(c)) c = ' ';
+    if (c === ' ' && (norm === '' || norm.endsWith(' '))) continue;
+    norm += c; for (let k = 0; k < c.length; k++) at.push(i);
+  }
+  const cut = new Array(orig.length).fill(false);
+  for (const v of vs) { let from = 0, k; while ((k = norm.indexOf(v, from)) >= 0) { for (let j = k; j < k + v.length; j++) cut[at[j]] = true; from = k + v.length; } }
+  let out = '', run = ''; const removed = [];
+  for (let i = 0; i <= orig.length; i++) {
+    if (i < orig.length && cut[i]) { run += orig[i]; continue; }
+    if (run) { out += PH; removed.push(run.trim()); run = ''; }
+    if (i < orig.length) out += orig[i];
+  }
+  return { text: collapsePH(out), removed };
+}
+// 全画面のタイトルの過半に共通する末尾（「 — サイト名」）。名前がデータだけになったかの判定に使う
+const SITE_SUFFIX = (() => {
+  const count = new Map(); let total = 0;
+  for (const n of G.nodes) {
+    if (!n.route || !n.title) continue; total++;
+    let last = -1; const re = /\s+[—–\-|｜:：]\s+/g; let m; while ((m = re.exec(n.title))) last = m.index;
+    if (last > 0) { const suf = n.title.slice(last); count.set(suf, (count.get(suf) || 0) + 1); }
+  }
+  let best = '', bestN = 0; for (const [k, c] of count) if (c > bestN) { best = k; bestN = c; }
+  return total >= 2 && bestN >= Math.max(2, total / 2) ? best : '';
+})();
+const stripSite = s => (SITE_SUFFIX && s.endsWith(SITE_SUFFIX) && s.length > SITE_SUFFIX.length ? s.slice(0, -SITE_SUFFIX.length) : s);
+const urlKey = u => { try { const x = new URL(u, origin || undefined); return decodePart(x.pathname).replace(/\/+$/, '') + x.search; } catch { return String(u); } };
+/** URL のうちデータとみなす値（ルートの * の区間と、名前だけ残したクエリの値） */
+function urlDataValues(n, url) {
+  let u; try { u = new URL(url, origin || undefined); } catch { return []; }
+  const [p, q] = (n.route || '').split('?');
+  const segs = p.split('/').filter(Boolean); const us = u.pathname.split('/').filter(Boolean).map(decodePart);
+  const out = [];
+  if (us.length === segs.length) segs.forEach((seg, i) => { if (seg === '*') out.push(us[i]); });
+  for (const k of (q ? q.split('&') : [])) if (!k.includes('=')) out.push(...u.searchParams.getAll(k));
+  return out;
+}
+/**
+ * 画面のテンプレート名。データの部分が見つからなければ null。
+ * 見出し（先頭の 1 つ）は、実例が 2 つ以上あれば実例どうしで違うときだけデータとみなす。実例が 1 つなら、
+ * データ区間を持つ画面の見出しをデータとみなす（シグネチャでも h1 をデータ扱いしている）。ただし見出しに URL の値が
+ * 入っていれば（「サービス業の企業一覧」）、URL の値がデータで残りはテンプレートの文言とみなす。
+ * 置き換えるとサイト名しか残らないとき（商品名だけのタイトル）は、データでない見出し（「商品詳細」）を名前にする。
+ */
+const templateOf = (() => {
+  const cache = new Map();
+  const compute = (n, known) => {
+    if (!n.route || !n.title) return null;
+    const inst = [{ url: n.url, title: n.title, heading: (n.headings || [])[0] || '' }, ...(n.samples || [])];
+    const vals = inst.map(i => urlDataValues(n, i.url).concat(known));
+    const heads = inst.map((i, k) => normText(scrubText(i.heading || '', vals[k]).text));
+    const headingIsData = inst.length >= 2 ? new Set(heads).size > 1 : (n.route.includes('*') && !!heads[0] && !heads[0].includes(PH));
+    const values = inst.map((i, k) => vals[k].concat(headingIsData && i.heading ? [i.heading] : []));
+    const scrubbed = inst.map((i, k) => scrubText(i.title, values[k]));
+    let name = scrubbed[0].text; let example = scrubbed[0].removed[0] || '';
+    const texts = [...new Set(scrubbed.map(x => x.text))];
+    // 代表（撮影した実例）のタイトルからデータを消せたら、それを名前にする。実例ごとにタイトルの形が違うアプリ
+    // （開示項目の多い企業だけ「〇〇の平均年収・…」になる）で、実例どうしの共通部分が「〇〇の〇〇」に痩せるのを避けるため
+    if (texts.length > 1 && !scrubbed[0].removed.length) {
+      // 代表のタイトルにデータが見つからない（商品名だけのタイトル）: 実例どうしの共通の前後を残し、違う部分をデータとみなす
+      const arr = texts.map(t => Array.from(t)); const min = Math.min(...arr.map(a => a.length));
+      let pre = 0; while (pre < min && arr.every(a => a[pre] === arr[0][pre])) pre++;
+      let suf = 0; while (suf < min - pre && arr.every(a => a[a.length - 1 - suf] === arr[0][arr[0].length - 1 - suf])) suf++;
+      name = collapsePH(arr[0].slice(0, pre).join('') + PH + arr[0].slice(arr[0].length - suf).join(''));
+      if (!example) example = arr[0].slice(pre, arr[0].length - suf).join('').split(PH).join('').trim();
+    }
+    const core = stripSite(name).split(PH).join('').replace(/[\s\p{P}]/gu, '');
+    if (!core) {
+      const h = (n.headings || [])[0];
+      if (h && !headingIsData) name = h + (SITE_SUFFIX && n.title.endsWith(SITE_SUFFIX) ? SITE_SUFFIX : '');
+    }
+    if (name === n.title) return null;
+    return {
+      name, example, headingIsData,
+      removed: scrubbed.flatMap(x => x.removed),
+      others: (n.mergedUrls || []).length + (n.jevMerged || []).length,
+      instances: inst.map((i, k) => ({ key: urlKey(i.url), values: values[k] })),
+      headings: (n.headings || []).map((h, i) => (i === 0 && headingIsData ? null : scrubText(h, vals[0]).text)).filter(Boolean),
+    };
+  };
+  // データ区間を持つ画面で「データ」と分かった値（企業名・業種名など）の辞書。URL にデータを持つ別の画面のタイトルからも消す。
+  // 比較画面のタイトル「ＡＩＡＩグループ株式会社を比べる」は、企業名が URL（法人番号）にも見出しにも出ないため、これで拾う
+  const KNOWN = [...new Set(G.nodes.filter(n => n.route && n.route.includes('*')).flatMap(n => { const t = compute(n, []); return t ? t.removed : []; }).map(normText).filter(v => v.length >= 3 && usableValue(v)))];
+  const carriesData = n => !!n.route && (n.route.includes('*') || n.route.split('?')[1] !== undefined && n.route.split('?')[1].split('&').some(k => !k.includes('=')));
+  return n => {
+    if (cache.has(n.id)) return cache.get(n.id);
+    let t = compute(n, carriesData(n) ? KNOWN : []);
+    // 設定 screenNames による上書き（ルートそのもの、またはクエリを除いたルートで引く）
+    const key = n.route ? [n.route, n.route.split('?')[0]].find(k => Object.prototype.hasOwnProperty.call(SCREEN_NAMES, k)) : undefined;
+    if (key) t = Object.assign({ example: '', others: 0, instances: [], headingIsData: false, headings: null }, t || {}, { name: SCREEN_NAMES[key], fixed: true });
+    cache.set(n.id, t); return t;
+  };
+})();
+const baseName = n => { const t = templateOf(n); return t ? t.name : (n.title || '(無題)'); };
+const headsOf = n => { const t = templateOf(n); return t && t.headings ? t.headings : (n.headings || []); };
+const exampleOf = n => { const t = templateOf(n); return t && t.example ? '例: ' + t.example + (t.others ? ' ほか ' + t.others + ' 件' : '') : ''; };
+/**
+ * 辺のラベル。行き先がテンプレート名の画面で、ラベルがその実例のデータ（企業名など）なら〇〇にする。
+ * 実例が記録されていない古い graph.json では、同じ画面から同じ行き先へ違うラベルのリンクが 2 本以上あればデータとみなす
+ */
+const labelOfEdge = (() => {
+  const labelsByPair = new Map();
+  for (const e of G.edges) { if (e.error || e.action.role !== 'link') continue; const k = e.from + '>' + e.to; if (!labelsByPair.has(k)) labelsByPair.set(k, new Set()); labelsByPair.get(k).add(e.action.label); }
+  return e => {
+    const a = e.action; const to = byId.get(e.to);
+    if (e.error || a.role !== 'link' || !a.href || !to || !to.route) return a.label;
+    const t = templateOf(to); if (!t) return a.label;
+    const found = t.instances.find(i => i.key === urlKey(a.href));
+    // 実例が記録されていない古い graph.json 向けの予備。ページ番号のような数字だけのラベルは対象にしない
+    if (!found) return to.route.includes('*') && usableValue(normText(a.label)) && (labelsByPair.get(e.from + '>' + e.to) || new Set()).size >= 2 ? PH : a.label;
+    const r = scrubText(a.label, found.values);
+    if (!r.removed.length) return a.label;
+    // 置き換えた残りが件数などの数字と記号だけなら、ラベル全体を〇〇にする（「サービス業 668」→「〇〇」）
+    const rest = r.text.split(PH).join('').replace(/\d+(?:[,.]\d+)*/g, '').replace(/[\s\p{P}]/gu, '');
+    return rest ? r.text : PH;
+  };
+})();
+
 // ---- 辺のまとめ: 同じ (from, to, ラベル) は 1 本にして本数を添える。失敗した辺はまとめない ----
+// ラベルは表示用（データの値を〇〇にしたもの）で比べるので、企業名のリンク 3 本は「〇〇 ×3」の 1 本になる
 const E = [];
 {
   const groups = new Map();
   G.edges.forEach((e, i) => {
-    const key = e.error ? 'err#' + i : e.from + '|' + e.to + '|' + fullBase(e.action);
+    const label = labelOfEdge(e); const act = label === e.action.label ? e.action : Object.assign({}, e.action, { label });
+    const key = e.error ? 'err#' + i : e.from + '|' + e.to + '|' + fullBase(act);
     let d = groups.get(key);
-    if (!d) { d = { from: e.from, to: e.to, full: e.error ? fullLabel(e.action) : fullBase(e.action), short: e.error ? shortBase(e.action) + (e.action.nth > 1 ? '(' + e.action.nth + ')' : '') : shortBase(e.action), error: e.error, raw: [], nav: false, discovery: false }; groups.set(key, d); E.push(d); }
+    if (!d) { d = { from: e.from, to: e.to, act, dataLabel: act !== e.action, full: e.error ? fullLabel(act) : fullBase(act), short: e.error ? shortBase(act) + (act.nth > 1 ? '(' + act.nth + ')' : '') : shortBase(act), error: e.error, raw: [], nav: false, discovery: false }; groups.set(key, d); E.push(d); }
     d.raw.push(e);
   });
 }
@@ -369,28 +520,29 @@ const navGroups = [];
 const navEdgeCount = E.filter(d => d.nav).length;
 
 // ---- 副題: 同じタイトルの画面は、他と共有していない見出しで区別する ----
+// 名前と見出しはテンプレート化したもので比べる（データの見出し＝企業名を副題にしない）
 const subtitleOf = (() => {
   const byTitle = new Map();
-  for (const n of G.nodes) { if (!byTitle.has(n.title)) byTitle.set(n.title, []); byTitle.get(n.title).push(n); }
+  for (const n of G.nodes) { const k = baseName(n); if (!byTitle.has(k)) byTitle.set(k, []); byTitle.get(k).push(n); }
   const cache = new Map();
   return n => {
     if (cache.has(n.id)) return cache.get(n.id);
-    const group = byTitle.get(n.title); let best = null;
-    if (group.length >= 2 && Array.isArray(n.headings)) {
+    const group = byTitle.get(baseName(n)); let best = null;
+    if (group.length >= 2) {
       const others = group.filter(o => o !== n); let bestShared = Infinity;
-      for (const h of n.headings) { if (!h) continue; const shared = others.filter(o => (o.headings || []).includes(h)).length; if (shared < bestShared) { best = h; bestShared = shared; } }
+      for (const h of headsOf(n)) { if (!h) continue; const shared = others.filter(o => headsOf(o).includes(h)).length; if (shared < bestShared) { best = h; bestShared = shared; } }
       if (bestShared >= others.length) best = null;
     }
     cache.set(n.id, best); return best;
   };
 })();
-const nameOf = n => (n.title || '(無題)') + (subtitleOf(n) ? ' · ' + subtitleOf(n) : '');
+const nameOf = n => baseName(n) + (subtitleOf(n) ? ' · ' + subtitleOf(n) : '');
 const pathTo = id => { const chain = []; let cur = id; while (parentOf.has(cur)) { chain.unshift(treeEdgeTo.get(cur)); cur = parentOf.get(cur); } return chain; };
 const subtreeOf = id => { const out = [id]; for (const c of children.get(id) || []) out.push(...subtreeOf(c)); return out; };
 
 // ---- 操作フロー: 木の葉ごとに「起点からそこまでの経路」を 1 本のシナリオとみなす ----
 const verb = d => {
-  const a = d.raw[0].action; const t = a.label || a.href || ''; const n = d.raw.length > 1 ? '（同じ操作が ' + d.raw.length + ' 件）' : '';
+  const a = d.act || d.raw[0].action; const t = a.label || a.href || ''; const n = d.raw.length > 1 ? '（同じ操作が ' + d.raw.length + ' 件）' : '';
   if (/(く|す|る|む|ぶ|ぐ|つ|う)$/.test(t) && /(を|に|へ|で)/.test(t)) return '「' + t + '」' + n;
   if (a.role === 'link') return '「' + t + '」を開く' + n;
   if (a.role === 'button') return '「' + t + '」を押す' + n;
@@ -403,12 +555,12 @@ const verb = d => {
 const groupOfNode = new Map();
 const chapters = [];
 {
-  const rootRoute = routeOf(byId.get(G.root).url);
+  const rootRoute = routeOfNode(byId.get(G.root));
   const rootGroup = { id: G.root, nodes: [G.root], isRoot: true };
   chapters.push(rootGroup);
   for (const c of children.get(G.root) || []) {
     const nodes = subtreeOf(c);
-    if (routeOf(byId.get(c).url) === rootRoute) rootGroup.nodes.push(...nodes);
+    if (routeOfNode(byId.get(c)) === rootRoute) rootGroup.nodes.push(...nodes);
     else chapters.push({ id: c, nodes, isRoot: false });
   }
   for (const n of G.nodes) if (!groupOfNode.has(n.id)) { /* 木に入っていない孤立ノードは起点の章へ */ }
@@ -416,7 +568,7 @@ const chapters = [];
   for (const n of G.nodes) if (!groupOfNode.has(n.id)) { rootGroup.nodes.push(n.id); groupOfNode.set(n.id, G.root); }
 }
 const chapterOf = id => chapters.find(c => c.id === groupOfNode.get(id));
-const chapterName = ch => ch.isRoot ? '起点 · ' + (byId.get(G.root).title || '(無題)') : nameOf(byId.get(ch.id));
+const chapterName = ch => ch.isRoot ? '起点 · ' + baseName(byId.get(G.root)) : nameOf(byId.get(ch.id));
 const UI = { home: 'グループ図', group: 'グループ', map: '全画面の木', flow: '操作フロー' };
 
 const scenarios = [];
@@ -425,7 +577,12 @@ const scenarios = [];
   for (const id of order) {
     if (id === G.root || (children.get(id) || []).length) continue;
     const steps = pathTo(id); const frames = [G.root, ...steps.map(d => d.to)]; const leaf = byId.get(id);
-    scenarios.push({ id, steps, frames, group: groupOfNode.get(id), name: verb(steps[steps.length - 1]) + ' → ' + nameOf(leaf),
+    const last = steps[steps.length - 1];
+    // 最後の操作がデータのリンク（企業名など）なら、ラベルではなく行き先の画面名で呼ぶ: 「〇〇の働きやすさデータ」を開く
+    const name = last.dataLabel && last.act.label === PH
+      ? '「' + stripSite(nameOf(leaf)) + '」を開く' + (last.raw.length > 1 ? '（同じ操作が ' + last.raw.length + ' 件）' : '')
+      : verb(last) + ' → ' + nameOf(leaf);
+    scenarios.push({ id, steps, frames, group: groupOfNode.get(id), name,
       err: frames.some(f => errCount(byId.get(f)) > 0), added: frames.some(isAdded), changed: frames.some(isChanged), external: leaf.truncated === '外部サイト' });
   }
 }
@@ -467,6 +624,8 @@ const issues = (() => {
     diff.removed.forEach((r, i) => { const key = 'removed#' + i; push(key, { kind: 'removed', label: '消えた画面', msg: '前回にあった画面が今回は到達できない', plain: true, isNew: true }); byScreen.get(key).removed = r; });
   }
   if (G.meta.stoppedBecause) push(G.root, { kind: 'trunc', label: '探索の停止', msg: G.meta.stoppedBecause, plain: true, isNew: false });
+  if (G.diff && G.diff.warning) push(G.root, { kind: 'trunc', label: '比較の注意', msg: G.diff.warning, plain: true, isNew: false });
+  if (G.meta.jev && G.meta.jev.errors) push(G.root, { kind: 'trunc', label: 'Jev の問い合わせ失敗', msg: G.meta.jev.errors + ' 回失敗し、その判定は機械的ルールだけで進めました（' + (G.meta.jev.lastError || '') + '）', plain: true, isNew: false });
   const sev = { console: 3, removed: 3, request: 2, action: 2, diff: 1, trunc: 0 };
   const list = [...byScreen.values()];
   for (const sc of list) { sc.items.sort((a, b) => sev[b.kind] - sev[a.kind]); sc.score = Math.max(...sc.items.map(i => sev[i.kind])) * 10 + (sc.items.some(i => i.isNew) ? 5 : 0) + Math.min(sc.items.length, 4); }
@@ -592,11 +751,11 @@ function nodeItem(n, p, nh, stubs) {
   if (isChanged(n.id)) badges.push('<span class="badge changed">変化</span>');
   if (errCount(n)) badges.push('<span class="badge err">エラー ' + errCount(n) + '</span>');
   if (n.truncated) badges.push('<span class="badge trunc" title="' + esc(n.truncated) + '">…</span>');
-  const sub = subtitleOf(n);
+  const sub = subtitleOf(n); const eg = exampleOf(n);
   const html = '<div class="badges">' + badges.join('') + '</div>' +
-    (compact ? '' : '<div class="thumb"><img loading="lazy" src="' + esc(n.screenshot) + '" alt="' + esc(n.title) + '"></div>') +
-    '<div class="title" title="' + esc(n.title) + '">' + esc(n.title || '(無題)') + '</div>' +
-    '<div class="sub" title="' + esc((sub ? sub + ' · ' : '') + n.url) + '">' + (sub ? '<b>' + esc(sub) + '</b> · ' : '') + '<code>' + esc(pathOf(n.url)) + '</code></div>' +
+    (compact ? '' : '<div class="thumb"><img loading="lazy" src="' + esc(n.screenshot) + '" alt="' + esc(baseName(n)) + '"></div>') +
+    '<div class="title" title="' + esc(baseName(n)) + '">' + esc(baseName(n)) + '</div>' +
+    '<div class="sub" title="' + esc([sub, eg, readable(n.url)].filter(Boolean).join(' · ')) + '">' + (sub ? '<b>' + esc(sub) + '</b> · ' : '') + (eg ? esc(eg) + ' · ' : '') + '<code>' + esc(shownPath(n)) + '</code></div>' +
     (errCount(n) ? '<div class="errline" title="' + esc(firstError(n)) + '">⚠ ' + esc(firstError(n)) + '</div>' : '');
   return { id: n.id, x: p.x, y: p.y, w: NODE_W, h: nh, html, name: nameOf(n), node: n, stubs, onClick: () => selectNode(n.id) };
 }
@@ -629,8 +788,8 @@ function buildNodesGraph(inSet, rootId) {
       const h = document.createElement('div'); h.className = 'col-head'; h.style.left = pos.get(list[0].id).x + 'px'; h.textContent = '深さ ' + d + ' · ' + list.length + ' 画面'; nodesEl.appendChild(h);
       const sorted = [...list].sort((a, b) => pos.get(a.id).y - pos.get(b.id).y); let i = 0;
       while (i < sorted.length) {
-        let j = i; while (j + 1 < sorted.length && routeOf(sorted[j + 1].url) === routeOf(sorted[i].url)) j++;
-        if (j > i) { const top = pos.get(sorted[i].id), bottom = pos.get(sorted[j].id); const g = document.createElement('div'); g.className = 'group'; g.style.left = (top.x - 12) + 'px'; g.style.top = (top.y - 14) + 'px'; g.style.width = (NODE_W + 24) + 'px'; g.style.height = (bottom.y + nh - top.y + 28) + 'px'; g.innerHTML = '<span class="glabel">' + esc(pathOf(sorted[i].url).split('?')[0]) + ' · ' + (j - i + 1) + ' 状態</span>'; groupsEl.appendChild(g); }
+        let j = i; while (j + 1 < sorted.length && routeOfNode(sorted[j + 1]) === routeOfNode(sorted[i])) j++;
+        if (j > i) { const top = pos.get(sorted[i].id), bottom = pos.get(sorted[j].id); const g = document.createElement('div'); g.className = 'group'; g.style.left = (top.x - 12) + 'px'; g.style.top = (top.y - 14) + 'px'; g.style.width = (NODE_W + 24) + 'px'; g.style.height = (bottom.y + nh - top.y + 28) + 'px'; g.innerHTML = '<span class="glabel">' + esc(routeOfNode(sorted[i])) + ' · ' + (j - i + 1) + ' 状態</span>'; groupsEl.appendChild(g); }
         i = j + 1;
       }
     }
@@ -780,7 +939,7 @@ function applyHighlight() {
   }
   placeLabels();
 }
-function matches(n, q) { return !q || (n.title + ' ' + n.url + ' ' + (n.headings || []).join(' ') + ' ' + (subtitleOf(n) || '')).toLowerCase().includes(q); }
+function matches(n, q) { return !q || (baseName(n) + ' ' + n.title + ' ' + n.url + ' ' + (n.headings || []).join(' ') + ' ' + (subtitleOf(n) || '')).toLowerCase().includes(q); }
 function passFilter(n) { return filter === 'all' || (filter === 'added' && isAdded(n.id)) || (filter === 'changed' && isChanged(n.id)) || (filter === 'error' && errCount(n) > 0); }
 function applyState() {
   for (const { L, p, bg, t } of links) { const hide = L.nav && !showNav(); p.classList.toggle('hidden', hide); bg.classList.toggle('hidden', hide); t.classList.toggle('hidden', hide); }
@@ -848,7 +1007,7 @@ function overviewPanel() {
   const errIds = G.nodes.filter(n => errCount(n) > 0).map(n => n.id); const failed = E.filter(d => d.error);
   panel.innerHTML =
     '<h2>探索の概要</h2>' +
-    '<dl class="kv"><dt>起点</dt><dd class="url">' + esc(G.meta.baseUrl) + '</dd><dt>開始</dt><dd>' + esc(G.meta.startedAt.replace('T', ' ').slice(0, 19)) + '</dd><dt>画面</dt><dd>' + G.nodes.length + '（' + (chapters.length - 1) + ' グループ）</dd><dt>操作</dt><dd>' + G.edges.length + '（失敗 ' + failed.length + '）</dd>' + (G.diff ? '<dt>比較対象</dt><dd class="url">' + esc(diff.previousRun) + '</dd>' : '<dt>比較</dt><dd>初回のため前回比なし</dd>') + '</dl>' +
+    '<dl class="kv"><dt>起点</dt><dd class="url">' + esc(G.meta.baseUrl) + '</dd><dt>開始</dt><dd>' + esc(G.meta.startedAt.replace('T', ' ').slice(0, 19)) + '</dd><dt>画面</dt><dd>' + G.nodes.length + '（' + (chapters.length - 1) + ' グループ）</dd><dt>操作</dt><dd>' + G.edges.length + '（失敗 ' + failed.length + '）</dd>' + (G.diff ? '<dt>比較対象</dt><dd class="url">' + esc(diff.previousRun) + (diff.warning ? '<div style="color:var(--amber);font-family:inherit">' + esc(diff.warning) + '</div>' : '') + '</dd>' : '<dt>比較</dt><dd>初回のため前回比なし</dd>') + (G.meta.learnedPathRules && G.meta.learnedPathRules.length ? '<dt>データ区間</dt><dd title="同じ形のリンクが並ぶ URL の区間。* の部分が違っても同じ画面として合流させた">' + G.meta.learnedPathRules.map(r => '<code>' + esc(r) + '</code>').join(' ') + '</dd>' : '') + (G.meta.jev ? '<dt>Jev</dt><dd>' + esc(G.meta.jev.model) + '・問い合わせ ' + G.meta.jev.requests + ' 回（キャッシュ ' + G.meta.jev.cacheHits + ' 回）・押さなかった操作 ' + G.meta.jev.skippedActions + '・合流 ' + G.meta.jev.mergedStates + (G.meta.jev.rejectedPathRules.length ? '・見送ったデータ区間 ' + G.meta.jev.rejectedPathRules.map(r => '<code>' + esc(r) + '</code>').join(' ') : '') + (G.meta.jev.errors ? '・<span style="color:var(--red)">失敗 ' + G.meta.jev.errors + ' 回（' + esc(G.meta.jev.lastError || '') + '）</span>' : '') + '</dd>' : '') + '</dl>' +
     (mode === 'home' ? '<div class="usage"><b>使い方</b><ol><li>左のカードは「グループ」＝起点から直接行ける画面のまとまり。押すと中の画面が木で開きます。</li><li>下の「操作フロー」を押すと、起点からの操作をコマ割りで辿れます。</li><li>戻るときは上のパンくずか Esc。</li></ol><div class="muted">エラーや差分をまとめて見たいときは、上の「問題一覧」を押してください。</div></div>' : '') +
     (mode === 'map' ? '<div class="usage"><b>使い方</b><ol><li>左は全画面の木。太い線が「初めてその画面に到達した経路」で、左から右へ深さ順です。画面を押すと右に詳細（拡大キャプチャはここで見ます）。</li><li>下の「操作フロー」を押すと、起点からの操作をコマ割りで辿れます。</li><li>画面が増えて読みにくくなったら、上の「グループ図」で画面のまとまりごとに見られます。</li></ol><div class="muted">エラーや差分をまとめて見たいときは「問題一覧」。サムネイルはヘッダのボタンで出せます。</div></div>' : '') +
     '<h3>操作フロー (' + scenarios.length + ' 本)</h3>' + flowList(scenarios) +
@@ -891,12 +1050,14 @@ function nodePanel(id, opts = {}) {
   const flowNav = opts.flow ? '<div class="navbtns"><button id="sb-prev"' + (step === 0 ? ' disabled' : '') + '>← 前へ</button><span class="muted">コマ ' + (step + 1) + ' / ' + flow.frames.length + '</span><button id="sb-next"' + (step >= flow.frames.length - 1 ? ' disabled' : '') + '>次へ →</button></div>' : '';
   const myFlows = scenarios.filter(s => s.frames.includes(id) && (!flow || s !== flow));
   panel.innerHTML =
-    '<h2>' + esc(n.title || '(無題)') + (subtitleOf(n) ? ' <span class="muted" style="font-weight:400">· ' + esc(subtitleOf(n)) + '</span>' : '') + '</h2>' +
-    '<div class="url">' + esc(n.url) + '</div>' + flowNav +
+    '<h2>' + esc(baseName(n)) + (subtitleOf(n) ? ' <span class="muted" style="font-weight:400">· ' + esc(subtitleOf(n)) + '</span>' : '') + '</h2>' +
+    (exampleOf(n) ? '<div class="muted" style="margin:-2px 0 4px;font-size:12px" title="撮影したのはこの実例です。企業名・商品名などデータの部分を〇〇にした名前で表示しています">' + esc(exampleOf(n)) + '</div>' : '') +
+    '<div class="url">' + esc(readable(n.url)) + '</div>' + (n.mergedUrls && n.mergedUrls.length ? '<details class="merged"><summary>同じ画面に合流した URL ' + n.mergedUrls.length + ' 件</summary><ul>' + n.mergedUrls.map(u => '<li><code>' + esc(pathOf(u)) + '</code></li>').join('') + '</ul></details>' : '') + (n.jevMerged && n.jevMerged.length ? '<details class="merged"><summary>Jev が同じ画面と判定して合流した URL ' + n.jevMerged.length + ' 件</summary><ul>' + n.jevMerged.map(m => '<li><code>' + esc(pathOf(m.url)) + '</code> <span class="cnt">' + m.score.toFixed(2) + '</span></li>').join('') + '</ul></details>' : '') + flowNav +
     '<h3>起点からの経路' + (chain.length ? '（' + chain.length + ' 回のクリック）' : '') + '</h3>' + (id === G.root ? '<p class="empty">この画面が起点です</p>' : crumbs) +
     '<h3>キャプチャ' + (isChanged(id) ? '（前回から内容が変わっています）' : '') + '</h3>' + capture +
-    '<dl class="kv" style="margin-top:8px"><dt>グループ</dt><dd><button class="linkbtn" data-chapter="' + chapterOf(id).id + '" title="グループの木で開く">' + esc(chapterName(chapterOf(id))) + ' ↗</button></dd><dt>深さ</dt><dd>' + n.depth + '</dd><dt>操作</dt><dd>' + n.actionsTried + ' / ' + n.actionsTotal + ' 件を試行</dd>' + (Array.isArray(n.headings) && n.headings.length ? '<dt>見出し</dt><dd>' + esc(n.headings.join(' / ')) + '</dd>' : '') + '<dt>シグネチャ</dt><dd><code>' + n.signature + '</code></dd>' + (n.truncated ? '<dt>打ち切り</dt><dd>' + esc(n.truncated) + '</dd>' : '') + '</dl>' +
+    '<dl class="kv" style="margin-top:8px"><dt>グループ</dt><dd><button class="linkbtn" data-chapter="' + chapterOf(id).id + '" title="グループの木で開く">' + esc(chapterName(chapterOf(id))) + ' ↗</button></dd><dt>深さ</dt><dd>' + n.depth + '</dd><dt>操作</dt><dd>' + n.actionsTried + ' / ' + (n.actionsPlanned ?? n.actionsTotal) + ' 件を試行' + (n.actionsPlanned != null && n.actionsPlanned < n.actionsTotal ? '（列挙 ' + n.actionsTotal + ' 件を同種で畳んだ）' : '') + (n.actionsSkippedCommon ? '（共通の開閉操作 ' + n.actionsSkippedCommon + ' 件は他の画面で試したため省略）' : '') + '</dd>' + (n.route ? '<dt>ルート</dt><dd><code>' + esc(n.route) + '</code></dd>' : '') + (Array.isArray(n.headings) && n.headings.length ? '<dt>見出し</dt><dd>' + esc(n.headings.join(' / ')) + '</dd>' : '') + '<dt>シグネチャ</dt><dd><code>' + n.signature + '</code></dd>' + (n.truncated ? '<dt>打ち切り</dt><dd>' + esc(n.truncated) + '</dd>' : '') + '</dl>' +
     '<h3>この画面でできる操作</h3>' + list(outs.map(d => li(d, 'out')), n.truncated ? '（' + esc(n.truncated) + 'のため列挙していません）' : '画面が変わる操作はありませんでした') + navBlock(outsNav.map(d => li(d, 'out')), '') +
+    (n.jevSkipped && n.jevSkipped.length ? '<h3 style="text-transform:none">Jev が危険と判定して押さなかった操作 (' + n.jevSkipped.length + ')</h3>' + list(n.jevSkipped.map(k => '<li>' + esc(k.label) + ' <span class="cnt">' + k.score.toFixed(2) + '</span></li>'), '') : '') +
     '<h3>ここへ来る操作</h3>' + list(ins.map(d => li(d, 'in')), n.id === G.root ? '起点' : 'なし') + navBlock(insNav.map(d => li(d, 'in')), '（他の画面から）') +
     (myFlows.length ? '<h3>この画面を通る操作フロー (' + myFlows.length + ')</h3><ul class="flows">' + myFlows.map(flowItem).join('') + '</ul>' : '') +
     '<h3>コンソールエラー (' + n.consoleErrors.length + ')</h3>' + (n.consoleErrors.length ? n.consoleErrors.map(e => '<div class="pre">' + esc(e) + '</div>').join('') : '<p class="empty">なし</p>') +

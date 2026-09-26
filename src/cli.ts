@@ -8,11 +8,13 @@ const USAGE = `flowmap — SPA を自動探索して画面遷移図を作る
 
 使い方:
   flowmap explore [--url <起点URL>] [--out <dir>] [--storage <auth.json>]
-                  [--max-states N] [--max-depth N] [--config <path>] [--no-render] [--yes]
-  flowmap render <実行ディレクトリ>
+                  [--max-states N] [--max-depth N] [--config <path>] [--no-render] [--yes] [--jev]
+  flowmap render <実行ディレクトリ> [--config <path>]
 
 explore は探索後に自動で index.html も生成する（--no-render で抑止）。
-設定は flowmap.config.json（カレント）を読み、CLI 引数が優先される。`;
+設定は flowmap.config.json（カレント）を読み、CLI 引数が優先される。
+--jev は Jev（typesafe.ai）による判定を有効にする。画面の要約を外部 API に送るので、送ってよいアプリにだけ使う。
+キーは環境変数 TYPESAFE_API_KEY か .env から読む。`;
 
 function parseArgs(argv: string[]) {
   const flags: Record<string, string | boolean> = {};
@@ -42,6 +44,7 @@ async function main() {
       storageState: str(flags.storage),
       maxStates: num(flags['max-states']),
       maxDepth: num(flags['max-depth']),
+      jev: flags.jev === true ? true : undefined,
     };
     const config = loadConfig(str(flags.config), overrides);
     const host = new URL(config.baseUrl).hostname;
@@ -56,7 +59,7 @@ async function main() {
     }
     const { runDir } = await explore({ config });
     if (!flags['no-render']) {
-      const out = render(runDir);
+      const out = render(runDir, { screenNames: config.screenNames });
       console.log(`ビューア: ${out}`);
     }
     return;
@@ -65,7 +68,9 @@ async function main() {
   if (cmd === 'render') {
     const dir = positional[0];
     if (!dir) { console.error('実行ディレクトリを指定してください'); process.exit(2); }
-    const out = render(resolve(dir));
+    // 表示だけに効く設定（screenNames）は、探索時ではなく今の設定ファイルから読む
+    const { screenNames } = loadConfig(str(flags.config), {});
+    const out = render(resolve(dir), { screenNames });
     console.log(`ビューア: ${out}`);
     return;
   }
