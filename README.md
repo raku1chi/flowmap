@@ -2,13 +2,13 @@
 
 SPA を自動探索して、画面遷移をフローチャートとスクリーンショットで一望するツールです。
 URL を渡すと押せるものを押して回り、どの操作でどの画面に行き、そこでエラーが出ていないかを 1 枚の `index.html` にまとめます。
-前回の実行と比べた「追加・消失・変化・新エラー」も自動で付きます。設計の詳細は [DESIGN.md](DESIGN.md) を参照してください。
+前回の実行と比べた「追加・消失・変化・新エラー」も自動で付き、CI では条件に当たれば失敗させられます。設計の詳細は [DESIGN.md](DESIGN.md) を参照してください。
 
 > **注意**: 探索は本物のクリックと送信を行います。ローカル開発サーバーかテスト用環境に対してだけ実行してください。本番環境には向けないでください。
 
 ## 必要なもの
 
-- Node.js 20 以上
+- Node.js 22 以上
 - pnpm（`corepack enable` で使えます）
 - Playwright の Chromium（初回は `pnpm exec playwright install chromium`）
 
@@ -16,6 +16,8 @@ URL を渡すと押せるものを押して回り、どの操作でどの画面�
 pnpm install
 pnpm exec playwright install chromium
 ```
+
+インストール済みの Chrome を使うときは設定で `"browserChannel": "chrome"`、任意の Chromium を使うときは環境変数 `FLOWMAP_CHROMIUM_PATH` に実行ファイルのパスを入れます。
 
 ## デモを動かす
 
@@ -25,7 +27,7 @@ pnpm exec playwright install chromium
 # 1. デモアプリを起動（http://localhost:3210）
 pnpm demo
 
-# 2. 別のターミナルで探索。終わると index.html も生成される（2 分ほど）
+# 2. 別のターミナルで探索。終わると index.html も生成される（1 分ほど）
 pnpm explore
 
 # 3. ビューアを開く
@@ -33,24 +35,29 @@ open flowmap-out/runs/<最新のディレクトリ>/index.html
 ```
 
 差分の動きを見るには、デモアプリを「商品 API が壊れた状態」で起動して、もう一度探索します。
-商品一覧が新しい画面として「追加」され、元の商品一覧と商品詳細が「消失」、商品一覧のコンソールエラーが「新エラー」として表示されます。
+商品一覧の読み込み失敗が「新エラー」、商品詳細などが「消失」として表示されます。
 
 ```sh
 DEMO_BREAK=1 pnpm demo
-pnpm explore
+pnpm explore --fail-on new-errors,removed   # 終了コード 1 になる
 ```
 
 ### デモアプリに仕込んである要素
 
 | 要素 | flowmap の確認ポイント |
 | --- | --- |
-| `/items/1` `/items/2` `/items/3` | ID 違いの詳細画面が 1 ノードに合流する |
-| お問い合わせフォーム | 自動入力して送信し、完了画面に遷移する |
-| 設定のタブ | URL が同じでも内容が違えば別ノードになる |
+| `/items/1` 〜 `/items/12`、`?page=2` | ID 違いの詳細画面とページ送りが 1 ノードに合流する |
+| `/categories/パソコン` など | 語の区間も、同じ形のリンクが並べば「データ区間」として学習して合流する |
+| ヘッダの「表示順」（localStorage に保存、summary に今の値が出る） | 押した設定が次の試行に持ち越されず、同じ画面が分裂しない |
+| ヘッダの検索（入力すると候補が開く） | 押していないフォームは埋めない。検索は送信して結果画面を撮る |
+| お問い合わせフォーム（required の同意チェックあり） | 押すフォームだけを自動入力して送信し、完了画面に遷移する |
+| 設定のタブ | URL が同じでも選ばれているタブが違えば別ノードになる |
 | ヘルプ・保存のモーダル | モーダルは別ノードとして撮れる |
+| 「印刷用ページを開く」（target=_blank） | 別タブのリンクも同じタブで開いて撮る |
 | レポート画面 | 500 応答とコンソールエラーが記録される |
 | 「わざとエラーを出す」ボタン | 画面が変わらなくても pageerror がそのノードに追記される |
-| example.com へのリンク | 外部サイトは撮影のみで操作を列挙しない |
+| フッターの時計（`data-flowmap-volatile`） | 開くたびに変わる部分は画面の同定と「変化」の判定から外れる |
+| 外部サイトへのリンク | 外部サイトは撮影のみで操作を列挙しない |
 | ログアウト・削除・退会・`data-flowmap-ignore`・`mailto:` | 除外され、押されない |
 
 ## 自分のアプリに使う
@@ -69,21 +76,32 @@ pnpm render flowmap-out/runs/<ディレクトリ>
 
 `bin/flowmap.mjs` を通せば `flowmap explore ...` / `flowmap render ...` としても呼べます。
 
+探索中は 1 画面ずつ、試した操作と着いた画面をログに出します。Ctrl-C で止めると、そこまでの結果を書き出してビューアも作ります（2 回押すと即座に終わります）。
+
 ### CLI 引数
 
 | 引数 | 内容 |
 | --- | --- |
 | `--url <URL>` | 起点 URL（`baseUrl` を上書き） |
+| `--config <path>` | 設定ファイルの場所（既定 `./flowmap.config.json`） |
 | `--out <dir>` | 出力先（`outDir` を上書き） |
 | `--storage <path>` | 認証状態ファイル（Playwright の storageState） |
 | `--max-states N` / `--max-depth N` | 画面数・クリック深さの上限 |
-| `--config <path>` | 設定ファイルの場所 |
+| `--workers N` | 並列に動かすブラウザの数（既定 4。結果は並列数によらず同じ） |
+| `--max-minutes N` | 時間の上限。超えたらそこまでの結果を書き出す |
+| `--baseline <dir>` | 比較対象の実行ディレクトリ（既定は同じ outDir の直前の実行） |
+| `--fail-on <条件,...>` | 当てはまれば終了コード 1。`new-errors`・`removed`・`errors`・`failed-actions` |
+| `--headed` | ブラウザの画面を出して動かす（様子を見るとき） |
+| `--quiet` | 操作ごとのログを出さない |
 | `--no-render` | 探索だけ行い index.html を作らない |
 | `--yes` | localhost 以外の起点でも確認なしで実行する |
+| `--jev` | Jev（typesafe.ai）で危険な操作を判定する（任意。下の「Jev について」） |
+
+終了コードは 0（成功）、1（`--fail-on` に当たった）、2（使い方・設定の誤り）、3（起点に接続できないなど探索できなかった）、130（中断）です。
 
 ### 設定ファイル（flowmap.config.json）
 
-主なキーは次のとおりです。全項目と既定値は DESIGN.md の 11 章にあります。
+コメント（`//`）を書けます。知らないキーや型の誤りは、探索を始める前にまとめて指摘します。主なキーは次のとおりで、全項目と既定値は DESIGN.md の 11 章にあります。
 
 ```jsonc
 {
@@ -92,55 +110,95 @@ pnpm render flowmap-out/runs/<ディレクトリ>
   "maxStates": 60,
   "maxDepth": 6,
   "maxActionsPerState": 25,
-  "maxActionsPerPattern": 3,
-  "maxLocalActionRepeats": 2,
-  "settleMs": 600,
-  "stabilizeMs": 2000,
-  "useBackNavigation": true,
-  "denyText": ["ログアウト", "削除", "退会", "logout", "sign out", "delete"],
+  "workers": 4,
+  // アプリ固有の危険な操作は必ず足す（既定: ログアウト・削除・退会・logout・sign out・delete など）
+  "denyText": ["ログアウト", "削除", "退会", "logout", "sign out", "delete", "承認", "出荷", "送金"],
   "denySelectors": ["[data-flowmap-ignore]"],
   "denyUrlPatterns": ["/logout", "/signout", "^mailto:", "^tel:"],
-  "pathRules": [{ "pattern": "^/users/[^/]+", "replace": "/users/*" }],
-  "queryParams": "names",
-  "structuralParams": ["tab"],
-  "fill": { "email": "flowmap@example.com", "text": "flowmap テスト入力" },
+  "fill": { "email": "flowmap@example.com", "text": "flowmap テスト入力", "name=zip": "1000001" },
   "allowSubmit": true,
   "allowedHosts": ["localhost", "127.0.0.1"],
-  "jev": { "enabled": false, "actions": true, "pages": true, "dataSegments": true }
+  // ログイン画面の URL。探索中にここへ続けて移ったら認証切れとして止める
+  "loginUrlPattern": "/login",
+  // 開くたびに変わる部分（おすすめ枠・時計など）を画面の同定から外す
+  "volatileSelectors": ["[data-flowmap-volatile]", ".recommendations"],
+  // Cookie の同意バナーなど、操作を覆うものを隠す
+  "hideSelectors": ["#cookie-consent"]
 }
 ```
 
-アプリ固有の危険な操作（「承認」「出荷」「送金」など）は `denyText` に必ず足してください。`--jev` を使うと意味で判定して押さなくなりますが、確実に止めたい操作は `denyText` にも書いておくのが安全です。
+アプリ固有の危険な操作（「承認」「出荷」「送金」など）は `denyText` に必ず足してください。
 押してほしくない要素には `data-flowmap-ignore` 属性を付けるのが確実です。
+
+### 同じ画面が分かれる・まとまりすぎるとき
+
+flowmap は URL と画面の骨格（ダイアログ・選ばれているタブ・見出し・操作対象・入力欄）から「同じ画面か」を決めます（DESIGN.md §5）。次の違いでは画面を分けません。
+
+- **データの違い。** `/items/12` と `/items/34` のような ID、`/companies/サービス業` のように同じ形のリンクが 3 本以上並ぶ区間（自動で学習し、ビューアの概要に「データ区間」として出ます）。自動で拾えない区間は `pathRules` に正規表現で書きます。
+- **クエリの違い。** ページ送り・絞り込み・並び替え・検索語は既定で見ません。`?tab=...` のように値で画面が変わるものは `structuralParams` に、`/item?id=12` のように値がレコードの ID なら `dataParams` に名前を書きます。
+- **表示設定や入力途中の値。** 開閉のラベルに出る今の値（「表示順: 在庫あり優先」）は見ません。探索は毎回まっさらなブラウザで起点から再現するので、途中で押した設定が他の画面に持ち越されることもありません。
+
+まだ分かれる画面は、右パネルの「再現」や問題一覧の「再現の不一致」に、どの部分が違ったかが出ます。開くたびに変わる部分なら `volatileSelectors` か `data-flowmap-volatile` 属性で外してください。`FLOWMAP_DEBUG=1` を付けて探索すると、各画面の骨格を `debug-structures.json` に書き出します。
 
 ### 画面名に企業名や商品名を出したくないとき
 
 `/company/1234` のような同じテンプレートの画面は、タイトルの企業名・商品名などを「〇〇」に置き換えた名前で表示します（「〇〇の働きやすさデータ」）。撮影した実例はカードと右パネルに「例: ＡＩＡＩグループ株式会社 ほか 3 件」と添えます。自動の名前が読みにくいときは、設定で直接指定できます。表示だけの設定なので、探索し直さずに `pnpm render` で反映できます。
 
 ```jsonc
-{ "screenNames": { "/company/*": "企業詳細", "/compare?cn": "企業の比較" } }
+{ "screenNames": { "/company/*": "企業詳細", "/compare": "企業の比較" } }
 ```
 
 キーはビューアの右パネルの「ルート」に出ている形で書きます。
 
-### Jev で判定を補う（任意）
+## CI で使う
 
-`--jev` を付けると、機械的なルールでは判断しにくい 3 か所に [Jev](https://docs.typesafe.ai/introduction)（typesafe.ai の型付き判定モデル）の判定を足します。
+PR ごとに探索して、main の実行結果と比べます。判断は人が行う前提で、`--fail-on` に書いた条件に当たったときだけ失敗させます。「変化」はデータの違いでも出るのでゲートには入れません。GitHub Actions の例です。
 
-- **押さない操作を増やす。** 「出荷する」「承認する」「送金する」のように `denyText` に無い操作でも、データを変えると判定したら押しません。フォームの送信や保存も押さなくなります。
-- **同じ画面を合流させる。** 企業詳細のように、データによって項目が増減して別の画面に分かれていたものを 1 つにまとめます。メニューやタブ、ダイアログを開いた状態は別の画面のまま残ります。
-- **データ区間の学習を確かめる。** `/settings/profile` `/settings/security` のような別々の画面を、同じ形の URL だからといって合流させないようにします。
+```yaml
+- run: pnpm install --frozen-lockfile && pnpm exec playwright install --with-deps chromium
+- run: pnpm start &                                   # 対象のアプリを起動（例）
+- run: echo "$STORAGE_STATE" > auth.json               # ログインが要るなら、シークレットから復元
+  env: { STORAGE_STATE: "${{ secrets.FLOWMAP_STORAGE_STATE }}" }
+- uses: actions/cache/restore@v4                       # main の実行結果（比較対象）
+  with: { path: flowmap-baseline, key: flowmap-main-${{ github.run_id }}, restore-keys: flowmap-main- }
+- run: >
+    pnpm exec flowmap explore --quiet --storage auth.json
+    --baseline flowmap-baseline --fail-on new-errors,removed --max-minutes 20
+- if: always()
+  run: cat flowmap-out/runs/*/summary.md >> "$GITHUB_STEP_SUMMARY"   # PR コメントに貼ってもよい
+- if: always()
+  uses: actions/upload-artifact@v4
+  with: { name: flowmap, path: flowmap-out/runs/ }
+```
+
+main のジョブでは同じように探索し、実行ディレクトリを `flowmap-baseline` として `actions/cache/save` で保存します。比較対象とシグネチャの計算方法・Jev の有無・探索範囲の設定が違うと、差分に注意書きが付き、`removed` のゲートは判定しません。実行ディレクトリには次のファイルができます。
+
+- `summary.md` — 件数・ゲートの結果・新エラーと消失の一覧（PR コメントにそのまま貼れる）
+- `summary.json` — 同じ内容を機械で読む形で
+
+## Jev について（任意・実験的）
+
+`--jev` を付けると、[Jev](https://docs.typesafe.ai/introduction)（typesafe.ai の型付き判定モデル）で「データを変える操作か」を判定し、危険と判定した操作を押しません。`denyText` に無い業務の動詞（「出荷する」「承認する」など）も止められる一方、フォームの送信や保存も押さなくなるので、地図の網羅は減ります。
+
+**画面の同定には使いません。** 同じ画面の重複は探索エンジンの側で決定的に直しました（DESIGN.md §4・§5）。Jev の値は実行ごとに少し揺れるので、画面の合流に使うと CI の差分が揺れます。合流（`jev.pages`）とデータ区間の確認（`jev.dataSegments`）は既定で無効です。
+
+おすすめの使い方は、初めて探索するアプリで一度 `--jev` を付けて回し、右パネルの「Jev が危険と判定して押さなかった操作」を見て `denyText` に書き写すことです。書き写したあとは Jev なしで同じ操作が止まります。CI では使わないでください。
 
 ```sh
 cp .env.example .env          # TYPESAFE_API_KEY を入れる（.env は git 管理外）
 pnpm explore --url http://localhost:3000 --jev
 ```
 
-判定のために、画面のタイトル・見出し・操作のラベル・URL のパスを typesafe.ai に送ります。認証情報、スクリーンショット、本文は送りません。社外に出せない内容を表示するアプリでは使わないでください。答えは `flowmap-out/jev-cache.json` にキャッシュするので、同じ画面には毎回同じ判定になります。設定は `flowmap.config.json` の `jev` で変えられます（DESIGN.md の 11 章）。フォームの先の画面も地図に載せたいときは `"jev": { "enabled": true, "actions": false }` のように操作の判定だけ止めます。
+判定のために、画面のタイトル・見出し・操作のラベル・URL のパスを typesafe.ai に送ります。認証情報、スクリーンショット、本文は送りません。社外に出せない内容を表示するアプリでは使わないでください。答えは `flowmap-out/jev-cache.json` にキャッシュします。
 
-### 同じテンプレートの画面が増えすぎるとき
+## 開発
 
-`/companies/サービス業` `/companies/小売業` のように URL の一部だけ違う画面は、既定で自動的に 1 つのノードに合流します（同じ画面に同じ形のリンクが 3 本以上並んでいれば、その区間をデータとみなします）。合流した区間はビューアの概要に「データ区間」として出ます。自動で拾えない場合は `pathRules` に正規表現で宣言してください。クエリは既定で名前だけを見るので `?page=2` と `?page=3` は同じ画面です。`?tab=...` のように値で画面が変わるものは `structuralParams` に名前を挙げます。
+```sh
+pnpm typecheck         # 型チェック
+pnpm test              # 単体テスト（ブラウザ不要）
+pnpm test:browser      # ブラウザを使うテスト。デモアプリを実際に探索する（4 分ほど）
+pnpm check             # 上の 3 つ
+```
 
 ## 出力
 
@@ -148,8 +206,12 @@ pnpm explore --url http://localhost:3000 --jev
 flowmap-out/runs/<ISO日時>/
 ├── graph.json    画面（nodes）・操作（edges）・前回との差分（diff）
 ├── shots/*.png   画面ごとのスクリーンショット
-└── index.html    単体で開けるビューア（graph.json を埋め込み済み）
+├── index.html    単体で開けるビューア（graph.json を埋め込み済み）
+├── summary.md    CI 向けの要約
+└── summary.json
 ```
+
+探索中も深さ 1 段ごとに graph.json を書き出すので、途中でプロセスが落ちても `pnpm render` でそこまでの結果を見られます。graph.json と index.html の URL は、トークンなどのクエリ値（`maskUrlParams`）を `***` に伏せてあります。
 
 ### ビューアの見方
 
@@ -163,6 +225,7 @@ flowmap-out/runs/<ISO日時>/
 - グループやフローを開く、コマを進める、画面を選ぶといった操作はブラウザの履歴に積まれるので、戻る／進むボタンが効きます。URL のハッシュ（`#g=…`、`#f=…&k=…`、`#map`）でそのままの表示を共有できます。
 - 画面を選ぶと右パネルに、起点からの経路・拡大キャプチャ（「変化」の画面は前回と並べて表示）・操作・エラーが出ます。検索ボックスでタイトル・URL・見出しから絞り込めます。
 - ラベルはリンクなら文言だけ、ボタンは `[送信する]`、タブは `〈通知設定〉` のように表記します。エラーのある画面はカードに最初のエラーを 1 行出します。
-- 同じ画面へ同じ操作が複数あれば 1 本にまとめて本数を添え、同じタイトルの画面が複数あればその画面にしかない見出し（タブ名・モーダルのタイトルなど）を副題に出します。表示倍率はヘッダの −／＋／全体、または Ctrl（⌘）+ ホイールで変えられます。
+- 同じ画面へ同じ操作が複数あれば 1 本にまとめて本数を添え、同じタイトルの画面が複数あれば、表示中のダイアログ（「保存しました」を表示中）・開いている開閉（「表示順: 標準」を開いた状態）・その画面にしかない見出し（タブ名など）を副題に出します。表示倍率はヘッダの −／＋／全体、または Ctrl（⌘）+ ホイールで変えられます。
+- 他の画面で行き先を確かめたので押さずに推定した操作（共通のナビゲーション）には、右パネルで「推定」と付きます。
 
 `storageState` のファイルは Cookie とトークンを平文で含みます。`.gitignore` に入れてあるので、そのままコミットしないでください。
