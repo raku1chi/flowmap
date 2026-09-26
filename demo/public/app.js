@@ -1,11 +1,22 @@
-// pushState ルーティングの素朴な SPA。flowmap の設計要素を一通り踏むための画面を持つ。
+// pushState ルーティングの素朴な SPA。flowmap の設計要素を一通り踏むための画面と、実アプリで探索を惑わせた仕掛けを持つ。
+//  - ヘッダの「表示順」は localStorage に保存され、summary に今の値が出る（起点を開き直しても残る）
+//  - ヘッダの検索欄は入力すると候補が開く（押していないフォームまで埋めると画面が変わる）
+//  - 商品一覧はページ送り（?page=）と、業種ならぬカテゴリ（/categories/<名前>）の一覧を持つ
+//  - 一覧の各行に「〇〇を比較に追加」（aria-label に商品名）。押すとその場で比較トレイが開き、sessionStorage に残って
+//    他の画面にも出る。トレイの「比較ページで開く」から比較ページへ進める（実アプリの「〇〇を並べて比べる」と同じ仕掛け）
 const app = document.getElementById('app');
 const modalRoot = document.getElementById('modal-root');
+const EXTERNAL_URL = document.querySelector('meta[name="demo-external"]')?.content || 'https://example.com/';
+const PAGE_SIZE = 6;
 
 const routes = [
   { re: /^\/$/, view: home },
   { re: /^\/items$/, view: items },
   { re: /^\/items\/(\d+)$/, view: itemDetail },
+  { re: /^\/items\/(\d+)\/print$/, view: itemPrint },
+  { re: /^\/categories\/([^/]+)$/, view: category },
+  { re: /^\/search$/, view: search },
+  { re: /^\/compare$/, view: compare },
   { re: /^\/contact$/, view: contact },
   { re: /^\/thanks$/, view: thanks },
   { re: /^\/settings$/, view: settings },
@@ -20,8 +31,54 @@ function navigate(path) {
   render();
 }
 
-async function render() {
+// ---- 表示順（localStorage に保存） ----
+const PREFS = { standard: '標準', stock: '在庫あり優先', cheap: '価格の安い順' };
+const getPref = () => { try { return localStorage.getItem('demo.pref') || 'standard'; } catch { return 'standard'; } };
+function drawPref() {
+  document.getElementById('pref-label').textContent = PREFS[getPref()];
+  document.getElementById('pref-options').innerHTML = Object.entries(PREFS)
+    .map(([k, v]) => `<button type="button" class="ghost${k === getPref() ? ' on' : ''}" data-pref="${k}">${v}</button>`).join('');
+}
+document.getElementById('pref-options').addEventListener('click', (e) => {
+  const b = e.target.closest('[data-pref]');
+  if (!b) return;
+  localStorage.setItem('demo.pref', b.dataset.pref);
+  drawPref();
+  render({ keepPref: true });
+});
+function sortItems(list) {
+  const pref = getPref();
+  if (pref === 'stock') return [...list].sort((a, b) => Number(b.stock > 0) - Number(a.stock > 0) || a.id - b.id);
+  if (pref === 'cheap') return [...list].sort((a, b) => a.price - b.price);
+  return list;
+}
+
+// ---- 比較トレイ（sessionStorage に保存。どの画面にも出る） ----
+const COMPARE_MAX = 3;
+const getCompare = () => { try { return JSON.parse(sessionStorage.getItem('demo.compare') || '[]'); } catch { return []; } };
+const setCompare = (list) => { sessionStorage.setItem('demo.compare', JSON.stringify(list)); render({ keepPref: true }); };
+function drawTray() {
+  const tray = document.getElementById('tray');
+  const list = getCompare();
+  tray.hidden = !list.length;
+  tray.innerHTML = list.length ? `
+    <h2>比較する商品（${list.length}）</h2>
+    <ul>${list.map((c) => `<li>${esc(c.name)} <a href="/items/${c.id}" data-link>詳しく見る</a> <button type="button" class="ghost" data-remove="${c.id}" aria-label="${esc(c.name)}を外す">外す</button></li>`).join('')}</ul>
+    <div class="row"><a class="btn" href="/compare" data-link>比較ページで開く</a><button type="button" class="ghost" id="compare-clear">すべて外す</button></div>` : '';
+}
+const compareButton = (i) => {
+  const at = getCompare().findIndex((c) => c.id === i.id);
+  return at >= 0
+    ? `<button type="button" class="ghost" data-compare="${i.id}">✓ ${at + 1} 件目</button>`
+    : `<button type="button" class="ghost" data-compare="${i.id}" data-name="${esc(i.name)}" aria-label="${esc(i.name)}を比較に追加">比較に追加</button>`;
+};
+
+async function render(opts = {}) {
   modalRoot.innerHTML = '';
+  if (!opts.keepPref) document.getElementById('pref').open = false;
+  drawPref();
+  drawTray();
+  hideSuggest();
   const path = location.pathname;
   document.querySelectorAll('.top nav a').forEach((a) => a.classList.toggle('active', path.startsWith(a.getAttribute('href'))));
   for (const r of routes) {
@@ -47,33 +104,62 @@ function home() {
     </div>
     <div class="card">
       <h2>外部リンク</h2>
-      <a href="https://example.com/">example.com を開く</a> ・
+      <a href="${esc(EXTERNAL_URL)}">外部サイトを開く</a> ・
       <a href="mailto:support@example.com">メールで問い合わせ</a>
     </div>`;
   document.getElementById('open-help').addEventListener('click', () => openModal('ヘルプ', '商品は一覧から詳細に進めます。お問い合わせフォームは送信すると完了画面に遷移します。'));
   document.getElementById('secret').addEventListener('click', () => alert('ignored'));
 }
 
-async function items() {
-  document.title = '商品一覧 - Inventory Demo';
+async function loadItems() {
   const res = await fetch('/api/items');
   if (!res.ok) {
     console.error(`商品一覧の取得に失敗しました: ${res.status}`);
     app.innerHTML = `<h1>商品一覧</h1><div class="card"><p class="err">商品を読み込めませんでした（${res.status}）</p><a class="btn ghost" href="/" data-link>トップへ戻る</a></div>`;
-    return;
+    return undefined;
   }
-  const list = await res.json();
+  return sortItems(await res.json());
+}
+
+const itemTable = (list) => `
+  <table>
+    <thead><tr><th>ID</th><th>商品名</th><th>価格</th><th>在庫</th><th></th></tr></thead>
+    <tbody>${list.map((i) => `
+      <tr>
+        <td>${i.id}</td><td><a href="/items/${i.id}" data-link>${esc(i.name)}</a></td><td>¥${i.price.toLocaleString()}</td><td>${i.stock}</td>
+        <td><a href="/items/${i.id}" data-link>詳細</a> ${compareButton(i)}</td>
+      </tr>`).join('')}
+    </tbody>
+  </table>`;
+
+async function items() {
+  document.title = '商品一覧 - Inventory Demo';
+  const list = await loadItems();
+  if (!list) return;
+  const pages = Math.max(1, Math.ceil(list.length / PAGE_SIZE));
+  const page = Math.min(pages, Math.max(1, Number(new URLSearchParams(location.search).get('page')) || 1));
+  const cats = await (await fetch('/api/categories')).json();
+  const pager = Array.from({ length: pages }, (_, i) => i + 1)
+    .map((p) => (p === page ? `<b>${p}</b>` : `<a href="/items?page=${p}" data-link>${p}</a>`)).join(' ');
   app.innerHTML = `
     <h1>商品一覧</h1>
-    <table>
-      <thead><tr><th>ID</th><th>商品名</th><th>価格</th><th>在庫</th><th></th></tr></thead>
-      <tbody>${list.map((i) => `
-        <tr>
-          <td>${i.id}</td><td>${esc(i.name)}</td><td>¥${i.price.toLocaleString()}</td><td>${i.stock}</td>
-          <td><a href="/items/${i.id}" data-link>詳細</a></td>
-        </tr>`).join('')}
-      </tbody>
-    </table>`;
+    <p class="muted">${list.length} 件中 ${(page - 1) * PAGE_SIZE + 1}〜${Math.min(page * PAGE_SIZE, list.length)} 件（表示順: ${PREFS[getPref()]}）</p>
+    <p class="row">カテゴリ: ${cats.map((c) => `<a href="/categories/${encodeURIComponent(c)}" data-link>${esc(c)}</a>`).join(' ')}</p>
+    ${itemTable(list.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE))}
+    <p class="pager">ページ: ${page > 1 ? `<a href="/items?page=${page - 1}" data-link>前へ</a> ` : ''}${pager}${page < pages ? ` <a href="/items?page=${page + 1}" data-link>次へ</a>` : ''}</p>`;
+}
+
+async function category([, raw]) {
+  const name = decodeURIComponent(raw);
+  document.title = `${name} - Inventory Demo`;
+  const list = await loadItems();
+  if (!list) return;
+  const inCat = list.filter((i) => i.category === name);
+  app.innerHTML = `
+    <h1>${esc(name)}の商品</h1>
+    <p class="muted">${inCat.length} 件</p>
+    ${itemTable(inCat)}
+    <p><a href="/items" data-link>すべての商品へ</a></p>`;
 }
 
 async function itemDetail([, id]) {
@@ -85,10 +171,12 @@ async function itemDetail([, id]) {
     <h1>商品詳細</h1>
     <div class="card">
       <p><strong style="font-size:18px">${esc(item.name)}</strong></p>
-      <p>ID: ${item.id} / 価格: ¥${item.price.toLocaleString()} / 在庫: ${item.stock}</p>
+      <p>ID: ${item.id} / カテゴリ: <a href="/categories/${encodeURIComponent(item.category)}" data-link>${esc(item.category)}</a> / 価格: ¥${item.price.toLocaleString()} / 在庫: ${item.stock}</p>
       ${item.stock === 0 ? '<p class="err">在庫切れ</p>' : ''}
       <div class="row">
         <a class="btn ghost" href="/items" data-link>一覧へ戻る</a>
+        <a class="btn ghost" href="/items/${item.id}/print" target="_blank">印刷用ページを開く</a>
+        <button type="button" class="ghost" data-compare-add="${item.id}" data-name="${esc(item.name)}">この商品を比較に追加</button>
         <button id="delete" class="danger">この商品を削除</button>
       </div>
     </div>`;
@@ -97,6 +185,42 @@ async function itemDetail([, id]) {
     await fetch(`/api/items/${id}`, { method: 'DELETE' });
     navigate('/items');
   });
+}
+
+async function itemPrint([, id]) {
+  const res = await fetch(`/api/items/${id}`);
+  const item = res.ok ? await res.json() : { name: '不明な商品', price: 0, stock: 0 };
+  document.title = `印刷用 ${item.name} - Inventory Demo`;
+  app.innerHTML = `<h1>印刷用ページ</h1><div class="card"><p><strong>${esc(item.name)}</strong></p><p>価格: ¥${item.price.toLocaleString()} / 在庫: ${item.stock}</p><button id="print" class="ghost">印刷する</button></div>`;
+  document.getElementById('print').addEventListener('click', () => {});
+}
+
+async function search() {
+  const q = new URLSearchParams(location.search).get('q') ?? '';
+  document.title = '検索結果 - Inventory Demo';
+  const list = await (await fetch(`/api/search?q=${encodeURIComponent(q)}`)).json();
+  app.innerHTML = `
+    <h1>「${esc(q)}」の検索結果</h1>
+    ${list.length ? itemTable(list) : '<div class="card"><p class="muted">該当する商品はありません。</p></div>'}`;
+}
+
+async function compare() {
+  document.title = '商品の比較 - Inventory Demo';
+  const list = getCompare();
+  if (!list.length) {
+    app.innerHTML = `<h1>商品の比較</h1><div class="card"><p class="muted">比較する商品がありません。一覧の「比較に追加」で選んでください。</p><a class="btn" href="/items" data-link>商品一覧へ</a></div>`;
+    return;
+  }
+  const res = await fetch('/api/items');
+  const all = res.ok ? await res.json() : [];
+  const rows = list.map((c) => all.find((i) => i.id === c.id) ?? { ...c, category: '-', price: 0, stock: 0 });
+  app.innerHTML = `
+    <h1>商品の比較</h1>
+    <table>
+      <thead><tr><th>商品名</th><th>カテゴリ</th><th>価格</th><th>在庫</th></tr></thead>
+      <tbody>${rows.map((i) => `<tr><td><a href="/items/${i.id}" data-link>${esc(i.name)}</a></td><td>${esc(i.category)}</td><td>¥${i.price.toLocaleString()}</td><td>${i.stock}</td></tr>`).join('')}</tbody>
+    </table>
+    <p><a href="/items" data-link>一覧に戻る</a></p>`;
 }
 
 function contact() {
@@ -112,6 +236,7 @@ function contact() {
       <select id="kind" name="kind"><option value="">選択してください</option><option value="bug">不具合</option><option value="other">その他</option></select>
       <label for="body">内容</label>
       <textarea id="body" name="body" rows="3"></textarea>
+      <label class="check"><input type="checkbox" name="agree" required /> 個人情報の取り扱いに同意する</label>
       <div class="row" style="margin-top:12px">
         <button type="submit">送信する</button>
         <button type="button" id="clear" class="ghost">クリア</button>
@@ -192,6 +317,26 @@ function openModal(title, text) {
   document.getElementById('modal-close').addEventListener('click', () => { modalRoot.innerHTML = ''; });
 }
 
+// ---- ヘッダの検索（入力すると候補が開く） ----
+const searchForm = document.getElementById('search-form');
+const suggest = document.getElementById('suggest');
+function hideSuggest() { suggest.hidden = true; suggest.innerHTML = ''; }
+searchForm.q.addEventListener('input', async () => {
+  const q = searchForm.q.value.trim();
+  if (!q) { hideSuggest(); return; }
+  const list = await (await fetch(`/api/search?q=${encodeURIComponent(q)}`)).json();
+  suggest.innerHTML = list.length
+    ? list.slice(0, 5).map((i) => `<a href="/items/${i.id}" data-link>${esc(i.name)}</a>`).join('')
+    : '<span class="muted">該当する商品はありません</span>';
+  suggest.hidden = false;
+});
+searchForm.addEventListener('submit', (e) => {
+  e.preventDefault();
+  const q = searchForm.q.value.trim();
+  searchForm.q.value = '';
+  navigate(`/search?q=${encodeURIComponent(q)}`);
+});
+
 // ---- 配線 ----
 document.addEventListener('click', (e) => {
   const a = e.target.closest('a[data-link]');
@@ -199,9 +344,27 @@ document.addEventListener('click', (e) => {
   e.preventDefault();
   navigate(a.getAttribute('href'));
 });
+document.addEventListener('click', (e) => {
+  const toggle = e.target.closest('[data-compare]');
+  const add = e.target.closest('[data-compare-add]');
+  const remove = e.target.closest('[data-remove]');
+  const list = getCompare();
+  if (toggle || add) {
+    const el = toggle || add;
+    const id = Number(toggle ? el.dataset.compare : el.dataset.compareAdd);
+    if (list.some((c) => c.id === id)) { if (toggle) setCompare(list.filter((c) => c.id !== id)); return; }
+    if (list.length < COMPARE_MAX) setCompare([...list, { id, name: el.dataset.name }]);
+  } else if (remove) {
+    setCompare(list.filter((c) => c.id !== Number(remove.dataset.remove)));
+  } else if (e.target.closest('#compare-clear')) {
+    setCompare([]);
+  }
+});
 document.getElementById('logout').addEventListener('click', async () => {
   await fetch('/api/logout', { method: 'POST' });
   app.innerHTML = '<h1>ログアウトしました</h1>';
 });
-window.addEventListener('popstate', render);
+const pad = (n) => String(n).padStart(2, '0');
+setInterval(() => { const d = new Date(); document.getElementById('clock').textContent = `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; }, 1000);
+window.addEventListener('popstate', () => render());
 render();

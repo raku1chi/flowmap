@@ -11,18 +11,21 @@
     "demo": "node demo/server.mjs",
     "explore": "tsx src/cli.ts explore",
     "render": "tsx src/cli.ts render",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "node --import tsx --test \"test/unit/*.test.ts\"",
+    "test:browser": "node --import tsx --test --test-concurrency=1 \"test/browser/*.test.ts\"",
+    "check": "pnpm typecheck && pnpm test && pnpm test:browser"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "packageManager": "pnpm@10.28.2",
   "dependencies": {
-    "playwright": "^1.63.0"
+    "playwright": "^1.63.0",
+    "tsx": "^4.23.15"
   },
   "devDependencies": {
     "@types/node": "^26.6.2",
-    "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }
 }
