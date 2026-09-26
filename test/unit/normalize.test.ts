@@ -182,6 +182,17 @@ test('pageData: データのルートへのリンクのラベル（企業名）�
   assert.ok(!a.dataValues.includes('詳細'), '全行で同じラベルはデータではない');
 });
 
+test('pageData: 空白の表記が違う企業名・同名の別会社・名前のリンクが無い行のボタンも、他の行と同じ形に畳む', () => {
+  // リンクのラベルは innerText（空白を詰める）、ボタンは aria-label（全角空白のまま）から取る
+  const rows = (names: [string, number][]) => names.flatMap(([name, id]) => [link(name.replace(/\s+/g, ' '), `/company/${id}`), link('詳細', `/company/${id}`), act(`${name}を並べて比べる`)]);
+  const page = (names: [string, number][], extra: RawAction[] = []) => snap('http://app.test/companies', { actions: [...header, ...rows(names), ...extra], headings: ['収録企業の一覧'], headingTags: ['h1'] });
+  const base: [string, number][] = [['株式会社ＩＨＩ', 1], ['愛眼株式会社', 2], ['アイコム株式会社', 3], ['株式会社アイ・エス・ビー', 4], ['ＡＩＡＩグループ株式会社', 5]];
+  const plain = signatureOf(page(base), ctx());
+  assert.equal(signatureOf(page([...base, ['アクシアル　リテイリング株式会社', 6]]), ctx()).structure, plain.structure);
+  assert.equal(signatureOf(page([...base, ['株式会社アルファ', 7], ['株式会社アルファ', 8]]), ctx()).structure, plain.structure);
+  assert.equal(signatureOf(page(base, [act('名無し商事株式会社を並べて比べる')]), ctx()).structure, plain.structure);
+});
+
 test('pageData: 行き先が 1 件だけなら、リンクのラベルをデータとみなさない', () => {
   assert.deepEqual(pageData([link('ノートPC', '/items/1'), link('詳しく見る', '/items/1')], 'http://app.test/compare', ctx()).values, []);
 });

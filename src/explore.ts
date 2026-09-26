@@ -23,7 +23,7 @@ import type { RawAction, Snapshot } from './inpage.js';
 import { clip, JevJudge, maskedPath } from './jev.js';
 import { maskUrl, maskUrlsInText, paramMatcher } from './mask.js';
 import {
-  actionKey, isLocalChange, labelKey, lineMatcher, planActions, proposeDataSegments, proposeQueryVariantPaths, sha1, signatureOf, structureDiff, variantOf,
+  actionKey, documentUrl, isLocalChange, labelKey, lineMatcher, planActions, proposeDataSegments, proposeQueryVariantPaths, sha1, signatureOf, structureDiff, variantOf,
   type NormalizeContext, type SignatureResult,
 } from './normalize.js';
 import { ActionError, describeAction, PROFILE, Session, type StorageStateObject } from './session.js';
@@ -124,6 +124,8 @@ const MAX_EXTERNAL_LINKS = 30;
 const EMPTY_ERRORS = () => ({ consoleErrors: [] as string[], failedRequests: [] as string[] });
 const firstLine = (e: unknown): string => String((e as Error)?.message ?? e).split('\n')[0];
 const readableUrl = (u: string): string => { try { return decodeURI(u); } catch { return u; } };
+/** 実例・合流した URL として残す形。ページ内のアンカー違い（#breakdown）は同じ実例なので区別しない */
+const instanceUrl = (u: string): string => readableUrl(documentUrl(u));
 const round2 = (x: number) => Math.round(x * 100) / 100;
 
 function timestampDir(d = new Date()): string {
@@ -355,10 +357,10 @@ class Explorer {
     for (const x of n.consoleErrors) if (!m.consoleErrors.includes(x)) m.consoleErrors.push(x);
     for (const x of n.failedRequests) if (!m.failedRequests.includes(x)) m.failedRequests.push(x);
     const merged = m.mergedUrls ?? (m.mergedUrls = []);
-    for (const u of [n.url, ...(n.mergedUrls ?? [])].map(readableUrl)) if (u !== readableUrl(m.url) && !merged.includes(u) && merged.length < MAX_MERGED) merged.push(u);
+    for (const u of [n.url, ...(n.mergedUrls ?? [])].map(instanceUrl)) if (u !== instanceUrl(m.url) && !merged.includes(u) && merged.length < MAX_MERGED) merged.push(u);
     if (n.route && n.route === m.route) {
       const samples = m.samples ?? (m.samples = []);
-      for (const s of [{ url: readableUrl(n.url), title: n.title, heading: n.headings[0] }, ...(n.samples ?? [])]) if (!samples.some((x) => x.url === s.url) && samples.length < MAX_SAMPLES) samples.push(s);
+      for (const s of [{ url: instanceUrl(n.url), title: n.title, heading: n.headings[0] }, ...(n.samples ?? [])]) if (s.url !== instanceUrl(m.url) && !samples.some((x) => x.url === s.url) && samples.length < MAX_SAMPLES) samples.push(s);
     }
     m.actionsTried += n.actionsTried;
     for (const l of n.localActions ?? []) {
@@ -494,8 +496,8 @@ class Explorer {
   private joinKnown(known: StateNode, snap: Snapshot, s: SignatureResult, errors: Outcome['errors']): void {
     for (const e of errors.consoleErrors) if (!known.consoleErrors.includes(e)) known.consoleErrors.push(e);
     for (const f of errors.failedRequests) if (!known.failedRequests.includes(f)) known.failedRequests.push(f);
-    if (snap.url === known.url) return;
-    const u = readableUrl(snap.url);
+    const u = instanceUrl(snap.url);
+    if (u === instanceUrl(known.url)) return;
     if (s.route && s.route === known.route) {
       const samples = known.samples ?? (known.samples = []);
       if (!samples.some((x) => x.url === u) && samples.length < MAX_SAMPLES) samples.push({ url: u, title: snap.title, heading: snap.headings[0] });
@@ -505,7 +507,7 @@ class Explorer {
       if (!merged.some((m) => m.url === u) && merged.length < MAX_MERGED) merged.push({ url: u, score: this.aliasScore.get(s.signature) ?? 0 });
     } else {
       const merged = known.mergedUrls ?? (known.mergedUrls = []);
-      if (u !== readableUrl(known.url) && !merged.includes(u) && merged.length < MAX_MERGED) merged.push(u);
+      if (!merged.includes(u) && merged.length < MAX_MERGED) merged.push(u);
     }
   }
 

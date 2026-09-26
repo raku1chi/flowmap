@@ -127,7 +127,7 @@ export interface JevConfig {
 /** graph.json の形の版。項目を足したり意味を変えたりしたら上げる */
 export const SCHEMA_VERSION = 3;
 /** シグネチャの計算方法の版。変えると前回との比較で「消失＋追加」が出るので、差分に注意書きを付ける */
-export const SIGNATURE_VERSION = 3;
+export const SIGNATURE_VERSION = 4;
 
 export interface ActionDesc {
   label: string;

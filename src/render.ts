@@ -395,7 +395,8 @@ const SITE_SUFFIX = (() => {
   return total >= 2 && bestN >= Math.max(2, total / 2) ? best : '';
 })();
 const stripSite = s => (SITE_SUFFIX && s.endsWith(SITE_SUFFIX) && s.length > SITE_SUFFIX.length ? s.slice(0, -SITE_SUFFIX.length) : s);
-const urlKey = u => { try { const x = new URL(u, origin || undefined); return decodePart(x.pathname).replace(/\/+$/, '') + x.search; } catch { return String(u); } };
+// 実例を見分けるキー。ページ内のアンカー（#breakdown）は同じ実例なので捨て、ハッシュルーティング（#/ か #!/）だけ残す
+const urlKey = u => { try { const x = new URL(u, origin || undefined); return decodePart(x.pathname).replace(/\/+$/, '') + x.search + (/^#!?\//.test(x.hash) ? decodePart(x.hash) : ''); } catch { return String(u); } };
 /** URL のうちデータとみなす値（ルートの * の区間と、名前だけ残したクエリの値） */
 function urlDataValues(n, url) {
   let u; try { u = new URL(url, origin || undefined); } catch { return []; }
@@ -426,7 +427,10 @@ const templateOf = (() => {
   const cache = new Map();
   const compute = (n, known) => {
     if (!n.route || !n.title) return null;
-    const inst = [{ url: n.url, title: n.title, heading: (n.headings || [])[0] || '' }, ...(n.samples || [])];
+    // 実例は URL で数える。同じ企業のページ内リンク（#breakdown）で着いた状態を別の実例にすると、見出しが実例どうしで
+    // 同じになり「データではない」と判定してしまう
+    const inst = [];
+    for (const i of [{ url: n.url, title: n.title, heading: (n.headings || [])[0] || '' }, ...(n.samples || [])]) if (!inst.some(x => urlKey(x.url) === urlKey(i.url))) inst.push(i);
     const vals = inst.map(i => urlDataValues(n, i.url).concat(known));
     const heads = inst.map((i, k) => normText(scrubText(i.heading || '', vals[k]).text));
     // 実例が 1 つなら、データ区間を持つ画面の見出しをデータとみなす。ただしタイトルの中にもうデータ（URL の値・辞書の名前）が
@@ -459,7 +463,7 @@ const templateOf = (() => {
     return {
       name, example, headingIsData, varying,
       removed: scrubbed.flatMap(x => x.removed),
-      others: (n.mergedUrls || []).length + (n.jevMerged || []).length,
+      others: new Set([...(n.mergedUrls || []), ...(n.jevMerged || []).map(m => m.url)].map(urlKey).filter(k => k !== urlKey(n.url))).size,
       instances: inst.map((i, k) => ({ key: urlKey(i.url), values: varying[k] ? values[k].concat([varying[k]]) : values[k] })),
       headings: (n.headings || []).map((h, i) => (i === 0 && headingIsData ? null : scrubText(h, vals[0]).text)).filter(Boolean),
     };

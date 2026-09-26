@@ -61,15 +61,26 @@ export function isIdLike(seg: string): boolean {
   return false;
 }
 
+const HASH_ROUTE = /^#!?(\/[^?]*)(\?.*)?$/;
+
 /** URL を区間に分ける。`#/` か `#!/` で始まるハッシュはハッシュルーティングとみなし、`#` の区間の後ろに続ける */
 function splitUrl(u: URL): { segs: string[]; search: string } {
   const segs = u.pathname.split('/').filter(Boolean).map(decode);
-  const m = u.hash.match(/^#!?(\/[^?]*)(\?.*)?$/);
+  const m = u.hash.match(HASH_ROUTE);
   if (m) {
     segs.push('#', ...m[1].split('/').filter(Boolean).map(decode));
     return { segs, search: m[2] ?? u.search };
   }
   return { segs, search: u.search };
+}
+
+/** ページ内のアンカー（`#breakdown`）を除いた URL。ハッシュルーティング（`#/` か `#!/`）は画面の一部なので残す */
+export function documentUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    if (!HASH_ROUTE.test(u.hash)) u.hash = '';
+    return u.href;
+  } catch { return url; }
 }
 
 /** 設定の pathRules をデコード済みパスに適用する */
@@ -249,13 +260,17 @@ export function proposeQueryVariantPaths(items: LinkItem[], pageUrl: string, ctx
 /** データとして扱える文字列か。数字・記号・空白を除いて 2 文字以上（「2」や「#」で無関係な部分を消さないため） */
 const isDataText = (v: string): boolean => v.replace(/[#\d\s\p{P}\p{S}]/gu, '').length >= 2;
 
+/** 空白（全角空白を含む）の並びを半角空白 1 つにする。aria-label はそのまま、リンクの文字列は innerText を詰めて取るので、表記を揃えてから比べる */
+const squeeze = (s: string): string => s.replace(/\s+/g, ' ').trim();
+
 /**
  * データ値をテキストから消す。見出し「サービス業の企業一覧」を「*の企業一覧」にして、業種違いの画面を合流させる。
- * text は数字を潰したもの（normalizeDigits）を渡す。値の数字も同じように潰して比べる
+ * text は数字を潰したもの（normalizeDigits）を渡す。値の数字も同じように潰して比べる。空白は両方とも詰める
+ * （リンクの「アクシアル リテイリング株式会社」と aria-label の「アクシアル　リテイリング株式会社を並べて比べる」を同じ名前とみなす）
  */
 export function scrub(text: string, dataValues: string[]): string {
-  const values = [...new Set(dataValues.map((v) => normalizeDigits(v.trim())))].filter(isDataText).sort((a, b) => b.length - a.length);
-  let out = text;
+  const values = [...new Set(dataValues.map((v) => squeeze(normalizeDigits(v))))].filter(isDataText).sort((a, b) => b.length - a.length);
+  let out = squeeze(text);
   for (const v of values) out = out.split(v).join('*');
   return out;
 }
@@ -338,17 +353,29 @@ export function pageData(actions: ActionLike[], pageUrl: string, ctx: NormalizeC
     hrefValues.set(u.href, r.dataValues);
   }
   for (const labels of byRoute.values()) {
-    const named = [...labels].filter(([, hrefs]) => hrefs.size === 1);
+    // 行き先の半分未満にしか使われないラベルを名前とみなす。全行で同じ「詳しく見る」は名前ではなく、
+    // 同名の別会社（「株式会社アルファ」が 2 社）は名前
+    const all = new Set([...labels.values()].flatMap((hrefs) => [...hrefs]));
+    const named = [...labels].filter(([, hrefs]) => hrefs.size === 1 || hrefs.size * 2 < all.size);
     // 行が 1 件だけだと「詳しく見る」も 1 つの行き先にしか使われないので、行き先が 2 件以上ある一覧だけを見る
-    if (named.length < 2 || new Set(named.map(([, hrefs]) => [...hrefs][0])).size < 2) continue;
-    for (const [label, hrefs] of named) values.push(label, ...(hrefValues.get([...hrefs][0]) ?? []));
+    if (named.length < 2 || new Set(named.flatMap(([, hrefs]) => [...hrefs])).size < 2) continue;
+    for (const [label, hrefs] of named) values.push(label, ...[...hrefs].flatMap((h) => hrefValues.get(h) ?? []));
   }
 
   const byRole = new Map<string, Set<string>>();
+  // 名前を消せた行ごとの操作の形（「*を並べて比べる」）と、その形になった元のラベル
+  const shapes = new Map<string, Map<string, Set<string>>>();
   for (const a of actions) {
     if (a.href || a.toggle) continue;
-    const pre = scrub(normalizeDigits(a.label), values);
-    if (pre.includes('*') || pre.length < MIN_AFFIX + MIN_VARYING) continue;
+    const raw = squeeze(normalizeDigits(a.label));
+    const pre = scrub(raw, values);
+    if (pre.includes('*')) {
+      const byShape = shapes.get(a.role) ?? new Map<string, Set<string>>();
+      shapes.set(a.role, byShape);
+      byShape.set(pre, (byShape.get(pre) ?? new Set<string>()).add(raw));
+      continue;
+    }
+    if (pre.length < MIN_AFFIX + MIN_VARYING) continue;
     const set = byRole.get(a.role) ?? new Set<string>();
     byRole.set(a.role, set);
     set.add(pre);
@@ -369,6 +396,19 @@ export function pageData(actions: ActionLike[], pageUrl: string, ctx: NormalizeC
       const max = Math.max(...cands.map((x) => count.get(x)!));
       const best = cands.filter((x) => count.get(x)! >= max * 0.8).sort((x, y) => y.length - x.length || (x < y ? -1 : x > y ? 1 : 0))[0];
       fold.set(`${role}|${l}`, best[0] === 'S' ? '*' + best.slice(1) : best.slice(1) + '*');
+    }
+  }
+  // 名前を消せなかった行（リンクの文字列と表記が違う企業名など）も、消せた行と同じ形（前置きと後置きが一致）なら同じ形に畳む。
+  // 消せた行は上の群から外れるので、消せなかった数行だけが骨格に残り、どの行が画面にあるかで骨格が変わってしまうため。
+  // 形は 2 つ以上の行から作られたもので、行の数は合わせて MIN_FAMILY 以上のときだけ
+  for (const [role, set] of byRole) {
+    for (const [shape, rows] of shapes.get(role) ?? []) {
+      const parts = shape.split('*');
+      if (parts.length !== 2 || rows.size < 2 || parts[0].length + parts[1].length < MIN_AFFIX) continue;
+      const [p, q] = parts;
+      const rest = [...set].filter((l) => !fold.has(`${role}|${l}`) && l.length - p.length - q.length >= MIN_VARYING && l.startsWith(p) && l.endsWith(q));
+      if (rows.size + rest.length < MIN_FAMILY) continue;
+      for (const l of rest) fold.set(`${role}|${l}`, shape);
     }
   }
   return { values, fold };
@@ -395,6 +435,23 @@ export function planActions<T>(actions: T[], keyOf: (a: T) => string, maxPerPatt
     if (!any) break;
   }
   return out;
+}
+
+/**
+ * 見出し 1 つを骨格の行にする。undefined を返すと骨格に入れない。
+ * dataLike はデータの画面（`/company/*` のようなデータ区間を持つルートと、クエリで絞り込む一覧）。clean は数字を # に、
+ * データの値を * にしたもの（「定着 45.6 点」→「* # 点」）。データの画面の h1 はレコードの名前なので、あることだけを残す。
+ *
+ * 8787 の企業ページは、開示項目の有無で h2・h3 が変わり、同じテンプレートが 3 ノードに分かれる。
+ *   株式会社カラダノート   h3「* 評価なし」「* # 点」  h2「参考にする数値」
+ *   株式会社ＩＨＩ         h3「* # 点」               h2「参考にする数値」
+ *   あいおいニッセイ同和   h3「* 評価なし」「* # 点」  （「参考にする数値」なし）
+ * タブ（role=tab）とダイアログは別の行（t: と d:）で区別するので、ここで見出しを捨ててもタブ違い・モーダルは分かれる。
+ */
+function headingLine(h: { tag: string; text: string }, dataLike: boolean, clean: (s: string) => string): string | undefined {
+  if (dataLike && h.tag === 'h1') return 'h:h1';
+  // TODO: データの画面の h2 以下をどう扱うか（今は非データの画面と同じく文言ごと残す）
+  return `h:${h.tag}:${clean(h.text)}`;
 }
 
 /** 重複を除いて並べ替える。骨格を DOM の出現順に依存させない（同じテンプレートでもデータ次第で節の順が入れ替わるため） */
@@ -430,7 +487,7 @@ export function analyzePage(snap: StructureInput, pageUrl: string, ctx: Normaliz
   const lines: string[] = [];
   if (snap.dialog !== undefined) lines.push(`d:${clean(snap.dialog)}`);
   for (const t of uniqSorted((snap.selectedTabs ?? []).map(clean))) lines.push(`t:${t}`);
-  lines.push(...new Set(snap.headings.map((h) => (dataLike && h.tag === 'h1' ? 'h:h1' : `h:${h.tag}:${clean(h.text)}`))));
+  lines.push(...new Set(snap.headings.map((h) => headingLine(h, dataLike, clean)).filter((x): x is string => x !== undefined)));
   const acts: string[] = [];
   for (const a of actions) {
     const key = actionKey(a, pageUrl, ctx, values, fold);
