@@ -9,5 +9,5 @@
     "noEmit": true,
     "types": ["node"]
   },
-  "include": ["src/**/*.ts", "experiments/**/*.ts"]
+  "include": ["src/**/*.ts", "experiments/**/*.ts", "test/**/*.ts"]
 }

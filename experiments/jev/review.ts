@@ -13,8 +13,10 @@
 import { chromium } from 'playwright';
 import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { signatureOf, type Snapshot } from '../../src/explore.js';
-import { DEFAULT_CONFIG, type ActionDesc, type Graph, type StateNode } from '../../src/types.js';
+import type { Snapshot } from '../../src/inpage.js';
+import { signatureOf } from '../../src/normalize.js';
+import { DEFAULT_CONFIG } from '../../src/config.js';
+import type { ActionDesc, Graph, StateNode } from '../../src/types.js';
 import { apiKey, callJev, mergeScore, MODEL, PAGE_SPLIT, pool, QUESTIONS } from './jev.js';
 import { contextFor, pairState, pathOf, perform, settle, stableSnapshot } from './page.js';
 

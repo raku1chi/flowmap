@@ -13,7 +13,7 @@
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { Snapshot } from './explore.js';
+import type { Snapshot } from './inpage.js';
 import { actionKey, normalizeDigits, normalizeRoute, type NormalizeContext } from './normalize.js';
 
 export const JEV_ENDPOINT = 'https://api.typesafe.ai/v1/systemone';

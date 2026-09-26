@@ -6,9 +6,9 @@
 import { chromium, type Page } from 'playwright';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
-import { signatureOf, type Snapshot } from '../../src/explore.js';
-import { learnDataSegments, normalizeRoute, type NormalizeContext } from '../../src/normalize.js';
-import { DEFAULT_CONFIG } from '../../src/types.js';
+import type { Snapshot } from '../../src/inpage.js';
+import { learnDataSegments, normalizeRoute, signatureOf, type NormalizeContext } from '../../src/normalize.js';
+import { DEFAULT_CONFIG } from '../../src/config.js';
 import {
   ACTION_CASES, APPS, LEARNED_PREFIXES, LIVE_LINK_GROUPS, PAGE_PAIRS, SYNTHETIC_LINK_GROUPS,
   type Dataset, type DatasetCase, type PageRef,
